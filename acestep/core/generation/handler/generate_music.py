@@ -226,6 +226,7 @@ class GenerateMusicMixin:
         repaint_wav_crossfade_sec: float = 0.0,
         repaint_mode: str = "balanced",
         repaint_strength: float = 0.5,
+        source_repaint_latents: Optional[torch.Tensor] = None,
         retake_seed: Optional[Union[str, float, int]] = None,
         retake_variance: float = 0.0,
         flow_edit_morph: bool = False,
@@ -261,6 +262,8 @@ class GenerateMusicMixin:
             use_tiled_decode: Whether tiled VAE decode is used.
             latent_shift: Additive latent post-processing value.
             latent_rescale: Multiplicative latent post-processing value.
+            source_repaint_latents: Optional session source latents used instead
+                of repaint-time VAE encoding for generated-source edits.
             progress: Optional callback taking ``(ratio, desc=...)``.
 
         Returns:
@@ -410,6 +413,7 @@ class GenerateMusicMixin:
                 dcw_wavelet=dcw_wavelet,
                 repaint_crossfade_frames=resolved_cf_frames,
                 repaint_injection_ratio=injection_ratio,
+                source_repaint_latents=source_repaint_latents,
                 task_type=task_type,
                 actual_retake_seed_list=actual_retake_seed_list,
                 retake_variance=retake_variance,

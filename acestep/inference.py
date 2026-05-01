@@ -18,7 +18,10 @@ import torch
 
 from acestep.audio_utils import AudioSaver, apply_fade, generate_uuid_from_params, normalize_audio, get_lora_weights_hash
 from acestep.constants import BPM_MIN, BPM_MAX, DURATION_MAX, TASK_TYPES, VALID_TIME_SIGNATURES
-from acestep.core.generation.handler.source_session import resolve_repaint_mode
+from acestep.core.generation.handler.source_session import (
+    load_source_session_track,
+    resolve_repaint_mode,
+)
 from acestep.core.generation.handler.source_session_save import (
     save_generation_session_artifacts,
 )
@@ -372,6 +375,92 @@ def _update_metadata_from_lm(
     return bpm, key_scale, time_signature, audio_duration, vocal_language, caption, lyrics
 
 
+def _apply_source_session_defaults(
+    session_params: Dict[str, Any],
+    bpm: Optional[int],
+    key_scale: str,
+    time_signature: str,
+    audio_duration: Optional[float],
+    vocal_language: str,
+    caption: str,
+    lyrics: str,
+) -> Tuple[Optional[int], str, str, Optional[float], str, str, str]:
+    """Fill missing repaint metadata from the generated source session.
+
+    User edits win.  In particular, non-empty lyrics/caption from the current
+    request are preserved so repaint can target the edited text.
+    """
+    if bpm is None:
+        bpm = _coerce_optional_int(
+            _first_present(session_params, "bpm", "cot_bpm")
+        )
+    if not key_scale:
+        key_scale = _coerce_optional_text(
+            _first_present(session_params, "keyscale", "key_scale", "cot_keyscale")
+        )
+    if not time_signature:
+        time_signature = _coerce_optional_text(
+            _first_present(
+                session_params,
+                "timesignature",
+                "time_signature",
+                "cot_timesignature",
+            )
+        )
+    if audio_duration is None or audio_duration <= 0:
+        audio_duration = _coerce_optional_float(
+            _first_present(session_params, "duration", "cot_duration")
+        )
+    if not vocal_language or vocal_language == "unknown":
+        vocal_language = _coerce_optional_text(
+            _first_present(session_params, "vocal_language", "cot_vocal_language", "language")
+        ) or vocal_language
+    if not caption:
+        caption = _coerce_optional_text(
+            _first_present(session_params, "caption", "cot_caption")
+        )
+    if not lyrics:
+        lyrics = _coerce_optional_text(
+            _first_present(session_params, "lyrics", "cot_lyrics")
+        )
+    return bpm, key_scale, time_signature, audio_duration, vocal_language, caption, lyrics
+
+
+def _first_present(values: Dict[str, Any], *keys: str) -> Any:
+    """Return the first non-empty, non-N/A value from ``values``."""
+    for key in keys:
+        value = values.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and value.strip() in ("", "N/A"):
+            continue
+        return value
+    return None
+
+
+def _coerce_optional_text(value: Any) -> str:
+    """Coerce optional session metadata to a non-N/A string."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "" if text in ("", "N/A") else text
+
+
+def _coerce_optional_float(value: Any) -> Optional[float]:
+    """Coerce optional session metadata to a positive float."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _coerce_optional_int(value: Any) -> Optional[int]:
+    """Coerce optional session metadata to a positive integer."""
+    number = _coerce_optional_float(value)
+    return int(number) if number is not None else None
+
+
 @_get_spaces_gpu_decorator(duration=180)
 def generate_music(
     dit_handler,
@@ -424,6 +513,40 @@ def generate_music(
         dit_input_vocal_language = params.vocal_language
         dit_input_lyrics = params.lyrics
         effective_repaint_mode = resolve_repaint_mode(params.repaint_mode, params.source_session_dir)
+        source_repaint_latents = None
+
+        if params.task_type == "repaint" and params.source_session_dir:
+            source_track = load_source_session_track(
+                params.source_session_dir,
+                params.source_track_index,
+            )
+            source_repaint_latents = source_track["latents"]
+            (
+                bpm,
+                key_scale,
+                time_signature,
+                audio_duration,
+                dit_input_vocal_language,
+                dit_input_caption,
+                dit_input_lyrics,
+            ) = _apply_source_session_defaults(
+                source_track["params"],
+                bpm,
+                key_scale,
+                time_signature,
+                audio_duration,
+                dit_input_vocal_language,
+                dit_input_caption,
+                dit_input_lyrics,
+            )
+            logger.info(
+                "[session_repaint] Loaded source session={} track={} duration={:.2f}s "
+                "latents_shape={}",
+                params.source_session_dir,
+                params.source_track_index,
+                float(source_track["duration"]),
+                tuple(source_repaint_latents.shape),
+            )
         # Determine if we need to generate audio codes
         # If user has provided audio_codes, we don't need to generate them
         # Otherwise, check if we need audio codes (lm_dit mode) or just metas (dit mode)
@@ -710,6 +833,7 @@ def generate_music(
             "repaint_wav_crossfade_sec": params.repaint_wav_crossfade_sec,
             "repaint_mode": effective_repaint_mode,
             "repaint_strength": params.repaint_strength,
+            "source_repaint_latents": source_repaint_latents,
             "retake_seed": params.retake_seed,
             "retake_variance": params.retake_variance,
             "flow_edit_morph": params.flow_edit_morph,

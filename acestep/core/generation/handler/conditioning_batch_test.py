@@ -43,7 +43,9 @@ class _Host(ConditioningBatchMixin):
         batch_size: int,
         target_wavs: torch.Tensor,
         audio_code_hints: List[Optional[str]],
+        source_repaint_latents: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]:
+        _ = source_repaint_latents
         target_latents = torch.zeros(batch_size, 128, 16, dtype=torch.float32)
         latent_masks = torch.ones(batch_size, 128, dtype=torch.long)
         silence_latent_tiled = torch.zeros(128, 16, dtype=torch.float32)

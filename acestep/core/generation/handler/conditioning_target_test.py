@@ -44,7 +44,7 @@ class _Host(ConditioningTargetMixin):
 
 
 class ConditioningTargetMixinTests(unittest.TestCase):
-    """Verify target audio is encoded through the standard VAE path."""
+    """Verify target audio/session latent preparation behavior."""
 
     def test_non_silent_target_wav_is_vae_encoded(self):
         """Non-silent repaint sources should use VAE-encoded source audio."""
@@ -77,6 +77,25 @@ class ConditioningTargetMixinTests(unittest.TestCase):
         torch.testing.assert_close(target_latents[0, :3], torch.ones(3, 3) * 9.0)
         torch.testing.assert_close(target_latents[1, :3], torch.ones(3, 3) * 9.0)
         self.assertEqual([4, 4], latent_masks.sum(dim=1).tolist())
+
+    def test_source_repaint_latents_skip_vae_encode_and_pad_with_silence(self):
+        """Session source latents should replace repaint-time VAE encoding."""
+        host = _Host()
+        target_wavs = torch.ones(1, 2, 4 * 1920)
+        source_latents = torch.ones(2, 3) * 5.0
+
+        _, target_latents, latent_masks, max_len, _ = host._prepare_target_latents_and_wavs(
+            batch_size=1,
+            target_wavs=target_wavs,
+            audio_code_hints=[None],
+            source_repaint_latents=source_latents,
+        )
+
+        self.assertEqual(0, host.encode_calls)
+        self.assertEqual(128, max_len)
+        torch.testing.assert_close(target_latents[0, :2], source_latents)
+        torch.testing.assert_close(target_latents[0, 2:4], torch.zeros(2, 3))
+        self.assertEqual(4, int(latent_masks[0].sum().item()))
 
 
 if __name__ == "__main__":
