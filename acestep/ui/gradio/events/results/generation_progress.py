@@ -307,7 +307,11 @@ def generate_with_progress(
         key = audios[i]["key"]
         audio_tensor = audios[i]["tensor"]
         sample_rate = audios[i]["sample_rate"]
-        audio_params = audios[i]["params"]
+        audio_params = _audio_params_with_session_marker(
+            audios[i]["params"],
+            result.extra_outputs,
+            i + 1,
+        )
 
         timestamp = int(time_module.time())
         temp_dir = os.path.join(DEFAULT_RESULTS_DIR, f"batch_{timestamp}")
@@ -457,6 +461,29 @@ def _extract_sample_tensor(extra_outputs, sample_idx):
     except Exception as e:
         print(f"[Auto Score] Failed to prepare tensor data for sample {sample_idx}: {e}")
         return None
+
+
+def _audio_params_with_session_marker(
+    audio_params: dict,
+    extra_outputs: dict,
+    track_index: int,
+) -> dict:
+    """Return output params annotated with hidden source-session identity.
+
+    Args:
+        audio_params: Per-audio parameter dictionary to write beside the WAV.
+        extra_outputs: Generation extra outputs that may contain a session dir.
+        track_index: One-based index of the audio inside the generated batch.
+
+    Returns:
+        A shallow copy of ``audio_params`` with session metadata when available.
+    """
+    params = dict(audio_params or {})
+    session_dir = str((extra_outputs or {}).get("session_output_dir") or "").strip()
+    if session_dir:
+        params["session_output_dir"] = session_dir
+        params["session_track_index"] = int(track_index)
+    return params
 
 
 def _persist_gradio_source_session(

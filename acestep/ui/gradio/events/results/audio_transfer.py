@@ -1,14 +1,10 @@
-"""Audio transfer helpers: send-to-Remix/Repaint and audio-to-codes conversion.
-
-Provides handlers that wire generated audio outputs back into the
-generation UI for remix, repaint, and code extraction workflows.
-"""
-import os
+"""Wire generated audio outputs back into Gradio remix/repaint workflows."""
 
 import gradio as gr
 
-from acestep.ui.gradio.i18n import t
 from acestep.ui.gradio.events.generation_handlers import compute_mode_ui_updates
+from acestep.ui.gradio.events.results.source_session_transfer import source_session_for_result
+from acestep.ui.gradio.i18n import t
 
 
 _BASE_REPAINT_MODE_CHOICES = ["auto", "conservative", "balanced", "aggressive"]
@@ -112,28 +108,7 @@ def send_audio_to_repaint(
     result_index=1,
     llm_handler=None,
 ):
-    """Send generated audio to ``src_audio`` and switch mode to Repaint.
-
-    Populates lyrics/caption from the generated audio and applies all
-    Repaint-mode UI updates atomically. If the selected result belongs to a
-    generated source session, also stores the hidden session path and sample
-    index used by session-backed most-natural repaint.
-
-    Args:
-        audio_file: Generated audio file path.
-        lm_metadata: LM metadata dict (may be ``None``).
-        current_lyrics: Current lyrics text in the UI.
-        current_caption: Current caption text in the UI.
-        current_mode: Currently active mode string.
-        current_batch_index: Currently displayed batch index.
-        batch_queue: Stored batch history.
-        result_index: One-based result-card index.
-        llm_handler: Optional LLM handler.
-
-    Returns:
-        Tuple of Gradio updates: core repaint updates, mode-UI updates, and
-        hidden source-session state.
-    """
+    """Send generated audio to Repaint and populate hidden source-session state."""
     if (
         llm_handler is None
         and batch_queue is None
@@ -152,8 +127,12 @@ def send_audio_to_repaint(
     mode_updates = list(compute_mode_ui_updates("Repaint", llm_handler, previous_mode=current_mode))
     mode_updates[19] = gr.update(value=caption, visible=True, interactive=True)
     mode_updates[20] = gr.update(value=lyrics, visible=True, interactive=True)
-    source_session_dir = _source_session_for_result(batch_queue, current_batch_index)
-    source_track_index = int(result_index or 1) if source_session_dir else 1
+    source_session_dir, source_track_index = source_session_for_result(
+        batch_queue,
+        current_batch_index,
+        audio_file,
+        result_index,
+    )
     source_session_state = source_session_dir or ""
     mode_updates[_REPAINT_MODE_UPDATE_INDEX] = _repaint_mode_update(source_session_dir)
 
@@ -163,23 +142,6 @@ def send_audio_to_repaint(
         *mode_updates,
         source_session_state, source_track_index,
     )
-
-
-def _source_session_for_result(batch_queue, current_batch_index) -> str:
-    """Return hidden source-session dir for the selected result, if present."""
-    if not isinstance(batch_queue, dict):
-        return ""
-    try:
-        batch_index = int(current_batch_index)
-    except (TypeError, ValueError):
-        return ""
-    batch_data = batch_queue.get(batch_index) or {}
-    extra_outputs = batch_data.get("extra_outputs") or {}
-    session_dir = str(extra_outputs.get("session_output_dir") or "").strip()
-    if not session_dir:
-        return ""
-    expanded = os.path.expanduser(session_dir)
-    return session_dir if os.path.isdir(expanded) else ""
 
 
 def _repaint_mode_update(source_session_dir: str):

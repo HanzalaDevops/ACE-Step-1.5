@@ -1,5 +1,7 @@
 """Tests for result-audio transfer helpers."""
 
+import json
+import os
 import tempfile
 import unittest
 
@@ -54,6 +56,38 @@ class SendAudioToRepaintTests(unittest.TestCase):
         self.assertNotIn("most natural", repaint_mode_update["choices"])
         self.assertEqual("", result[-2])
         self.assertEqual(1, result[-1])
+
+    def test_send_to_repaint_restores_source_session_from_audio_sidecar(self):
+        """Generated audio JSON should recover hidden repaint session state."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_dir = os.path.join(temp_dir, "source_session")
+            os.makedirs(session_dir)
+            audio_path = os.path.join(temp_dir, "sample-2.wav")
+            json_path = os.path.join(temp_dir, "sample-2.json")
+            with open(json_path, "w", encoding="utf-8") as file_obj:
+                json.dump(
+                    {
+                        "session_output_dir": session_dir,
+                        "session_track_index": 2,
+                    },
+                    file_obj,
+                )
+
+            result = send_audio_to_repaint(
+                audio_path,
+                {"lyrics": "saved lyrics", "caption": "saved caption"},
+                "",
+                "",
+                "Custom",
+                0,
+                {},
+                1,
+            )
+
+        repaint_mode_update = result[6 + 33]
+        self.assertIn("most natural", repaint_mode_update["choices"])
+        self.assertEqual(session_dir, result[-2])
+        self.assertEqual(2, result[-1])
 
 
 if __name__ == "__main__":
