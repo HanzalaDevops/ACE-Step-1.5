@@ -12,6 +12,33 @@ import numpy as np
 from loguru import logger
 
 
+def can_save_generation_session_artifacts(result: Any) -> bool:
+    """Return whether a generation result has the artifacts retake needs.
+
+    Args:
+        result: ``GenerationResult``-like object with audios and extra outputs.
+
+    Returns:
+        ``True`` only when every output track has audio codes and matching final
+        latents are present. This is intentionally capability-based rather than
+        task-name-based so any ACE-generated result with saved codes can become
+        a most-natural repaint source.
+    """
+    if not getattr(result, "success", False):
+        return False
+    audios = list(getattr(result, "audios", None) or [])
+    if not audios:
+        return False
+    extra = getattr(result, "extra_outputs", None) or {}
+    pred_latents = extra.get("pred_latents")
+    if pred_latents is None:
+        return False
+    shape = getattr(pred_latents, "shape", None)
+    if shape is not None and len(shape) > 0 and int(shape[0]) < len(audios):
+        return False
+    return all(_track_audio_codes(audio.get("params") or {}) for audio in audios)
+
+
 def save_generation_session_artifacts(
     *,
     result: Any,
@@ -42,7 +69,7 @@ def save_generation_session_artifacts(
     tracks = []
     for index, audio in enumerate(result.audios or [], start=1):
         params = dict(audio.get("params") or {})
-        audio_codes = str(params.get("audio_codes") or params.get("audio_code_string") or "").strip()
+        audio_codes = _track_audio_codes(params)
         if not audio_codes:
             raise ValueError("save_session_artifacts requires per-track audio_codes")
         params_path = root / f"{index:02d}_params.json"
@@ -59,7 +86,12 @@ def save_generation_session_artifacts(
     logger.info("[retake_session] Saved reusable session artifacts to {}", root)
 
 
-def _copy_session_audio(root: Path, params: dict[str, Any], audio: dict[str, Any], index: int) -> None:
+def _copy_session_audio(
+    root: Path,
+    params: dict[str, Any],
+    audio: dict[str, Any],
+    index: int,
+) -> None:
     """Copy the generated audio file into the reusable session directory."""
     audio_path = audio.get("path")
     if not audio_path or not os.path.exists(audio_path):
@@ -74,3 +106,8 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     """Write JSON using UTF-8 and stable indentation."""
     with path.open("w", encoding="utf-8") as file:
         json.dump(value, file, ensure_ascii=False, indent=2, default=str)
+
+
+def _track_audio_codes(params: dict[str, Any]) -> str:
+    """Return non-empty per-track audio codes from saved parameter values."""
+    return str(params.get("audio_codes") or params.get("audio_code_string") or "").strip()

@@ -16,6 +16,9 @@ from acestep.core.generation.handler.retake_session import (
     resolve_repaint_mode,
     save_generation_session_artifacts,
 )
+from acestep.core.generation.handler.retake_session_save import (
+    can_save_generation_session_artifacts,
+)
 
 
 class RetakeSessionTests(unittest.TestCase):
@@ -81,6 +84,7 @@ class RetakeSessionTests(unittest.TestCase):
     def test_save_session_artifacts_requires_complete_retake_inputs(self):
         """Reusable session persistence should not write incomplete artifacts."""
         result = SimpleNamespace(
+            success=True,
             audios=[{"params": {"audio_codes": "<|audio_code_1|>"}}],
             extra_outputs={},
         )
@@ -92,6 +96,7 @@ class RetakeSessionTests(unittest.TestCase):
     def test_save_session_artifacts_writes_loadable_track(self):
         """Saved generation artifacts should be directly loadable for retake."""
         result = SimpleNamespace(
+            success=True,
             audios=[{"params": {"audio_codes": "<|audio_code_1|>", "caption": "source"}}],
             extra_outputs={"pred_latents": torch.ones(1, 6, 3)},
         )
@@ -102,6 +107,36 @@ class RetakeSessionTests(unittest.TestCase):
 
             self.assertEqual("<|audio_code_1|>", source["audio_codes"])
             self.assertEqual((6, 3), tuple(source["latents"].shape))
+
+    def test_can_save_session_artifacts_is_capability_based(self):
+        """Any task result with audio codes and final latents can be a source."""
+        result = SimpleNamespace(
+            success=True,
+            audios=[{"params": {"task_type": "cover", "audio_codes": "<|audio_code_1|>"}}],
+            extra_outputs={"pred_latents": torch.ones(1, 6, 3)},
+        )
+
+        self.assertTrue(can_save_generation_session_artifacts(result))
+
+    def test_can_save_session_artifacts_rejects_missing_codes(self):
+        """Uploaded-audio style outputs without codes should not expose retake."""
+        result = SimpleNamespace(
+            success=True,
+            audios=[{"params": {"task_type": "cover"}}],
+            extra_outputs={"pred_latents": torch.ones(1, 6, 3)},
+        )
+
+        self.assertFalse(can_save_generation_session_artifacts(result))
+
+    def test_can_save_session_artifacts_rejects_missing_latents(self):
+        """Retake needs saved final latents as well as audio codes."""
+        result = SimpleNamespace(
+            success=True,
+            audios=[{"params": {"audio_codes": "<|audio_code_1|>"}}],
+            extra_outputs={},
+        )
+
+        self.assertFalse(can_save_generation_session_artifacts(result))
 
 
 if __name__ == "__main__":

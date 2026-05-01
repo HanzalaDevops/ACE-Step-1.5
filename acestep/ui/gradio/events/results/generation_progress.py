@@ -15,7 +15,10 @@ import torch
 from loguru import logger
 
 from acestep.audio_utils import save_audio
-from acestep.core.generation.handler.retake_session_save import save_generation_session_artifacts
+from acestep.core.generation.handler.retake_session_save import (
+    can_save_generation_session_artifacts,
+    save_generation_session_artifacts,
+)
 from acestep.gpu_config import (
     check_duration_limit,
     check_batch_size_limit,
@@ -233,14 +236,7 @@ def generate_with_progress(
         config=gen_config,
         progress=progress,
     )
-    _persist_gradio_source_session(
-        result=result,
-        task_type=task_type,
-        audio_codes=text2music_audio_code_string,
-        think_enabled=bool(think_checkbox),
-        lm_initialized=bool(lm_initialized),
-        flow_edit_morph=bool(flow_edit_morph),
-    )
+    _persist_gradio_source_session(result=result)
     _persist_gradio_feature_cache(result)
 
     audio_outputs = [None] * 8
@@ -489,26 +485,13 @@ def _audio_params_with_session_marker(
 def _persist_gradio_source_session(
     *,
     result,
-    task_type: str,
-    audio_codes: str,
-    think_enabled: bool,
-    lm_initialized: bool,
-    flow_edit_morph: bool,
 ) -> None:
-    """Save hidden source-session artifacts for Gradio text2music outputs.
+    """Save hidden source-session artifacts for retake-capable Gradio outputs.
 
     The artifacts are used by "Send To Repaint" to enable session-backed
     most-natural repaint without exposing filesystem fields in the UI.
     """
-    if not _should_persist_gradio_source_session(
-        task_type=task_type,
-        audio_codes=audio_codes,
-        think_enabled=think_enabled,
-        lm_initialized=lm_initialized,
-        flow_edit_morph=flow_edit_morph,
-    ):
-        return
-    if not getattr(result, "success", False):
+    if not can_save_generation_session_artifacts(result):
         return
     session_dir = _build_gradio_source_session_dir()
     try:
@@ -531,23 +514,6 @@ def _persist_gradio_feature_cache(result) -> None:
         persist_feature_cache(extra_outputs, cache_dir)
     except (OSError, RuntimeError) as exc:
         logger.warning("[gradio_features] Could not save score/LRC feature cache: {}", exc)
-
-
-def _should_persist_gradio_source_session(
-    *,
-    task_type: str,
-    audio_codes: str,
-    think_enabled: bool,
-    lm_initialized: bool,
-    flow_edit_morph: bool,
-) -> bool:
-    """Return whether Gradio should save hidden retake source artifacts."""
-    if task_type != "text2music" or flow_edit_morph:
-        return False
-    if audio_codes and str(audio_codes).strip():
-        return True
-    return think_enabled and lm_initialized
-
 
 def _build_gradio_source_session_dir() -> str:
     """Build a unique hidden session directory under Gradio outputs."""
