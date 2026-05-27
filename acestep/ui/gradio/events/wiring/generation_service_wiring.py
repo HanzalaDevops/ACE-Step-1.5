@@ -4,6 +4,7 @@ This module contains wiring related to service initialization, LoRA controls,
 auto-checkbox controls, and visibility updates for generation components.
 """
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,8 @@ from .context import (
     build_auto_checkbox_inputs,
     build_auto_checkbox_outputs,
 )
+
+_LANGUAGE_ENV_PATTERN = re.compile(r"^\s*LANGUAGE\s*=")
 
 
 def register_generation_service_handlers(
@@ -235,7 +238,7 @@ def _apply_runtime_language(language: str) -> dict[str, Any]:
 
     try:
         _persist_startup_language(language)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         gr.Warning(t("messages.language_save_failed", error=str(exc)))
         return gr.update(value=current_language)
 
@@ -259,7 +262,7 @@ def _language_display_name(language: str) -> str:
 
 def _persist_startup_language(language: str, env_path: Path | None = None) -> None:
     """Update LANGUAGE in .env so the next server startup uses ``language``."""
-    target_env_path = env_path or Path(__file__).resolve().parents[5] / ".env"
+    target_env_path = env_path or _resolve_project_root() / ".env"
 
     lines: list[str] = []
     if target_env_path.exists():
@@ -267,9 +270,8 @@ def _persist_startup_language(language: str, env_path: Path | None = None) -> No
 
     updated = False
     for idx, line in enumerate(lines):
-        stripped = line.lstrip()
-        if stripped.startswith("LANGUAGE=") and not stripped.startswith("#"):
-            leading_whitespace = line[: len(line) - len(stripped)]
+        if _LANGUAGE_ENV_PATTERN.match(line):
+            leading_whitespace = line[: len(line) - len(line.lstrip())]
             lines[idx] = f"{leading_whitespace}LANGUAGE={language}"
             updated = True
             break
@@ -278,3 +280,11 @@ def _persist_startup_language(language: str, env_path: Path | None = None) -> No
         lines.append(f"LANGUAGE={language}")
 
     target_env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _resolve_project_root() -> Path:
+    """Find project root by walking up to the nearest directory with ``.git``."""
+    for parent in Path(__file__).resolve().parents:
+        if (parent / ".git").exists():
+            return parent
+    raise RuntimeError("Could not locate project root for .env language persistence")
