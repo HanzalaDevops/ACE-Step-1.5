@@ -5,11 +5,19 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
+DEFAULT_STEPS_TURBO = 8
+DEFAULT_STEPS_SFT = 50
+DEFAULT_STEPS_BASE = 32
+DEFAULT_STEPS_LEGACY = 8
+
 
 def _has_model_token(token: str, model_name: str) -> bool:
-    """Return whether *token* appears as a delimited segment in model name."""
+    """Return whether *token* appears as a delimited segment in model name.
 
-    return re.search(rf"(^|[\\\\/._-]){token}($|[\\\\/._-])", model_name) is not None
+    Matching is case-sensitive; callers should normalize case when needed.
+    """
+
+    return re.search(rf"(^|[\\/._-]){token}($|[\\/._-])", model_name) is not None
 
 
 def _default_inference_steps_for_model(model_name: Optional[str]) -> int:
@@ -24,12 +32,12 @@ def _default_inference_steps_for_model(model_name: Optional[str]) -> int:
 
     normalized = (model_name or "").strip().lower()
     if not normalized:
-        return 8
+        return DEFAULT_STEPS_LEGACY
     if _has_model_token("turbo", normalized):
-        return 8
+        return DEFAULT_STEPS_TURBO
     if _has_model_token("sft", normalized):
-        return 50
-    return 32
+        return DEFAULT_STEPS_SFT
+    return DEFAULT_STEPS_BASE
 
 
 def build_generate_music_request(
@@ -64,9 +72,8 @@ def build_generate_music_request(
         track_classes = [track_classes]
 
     requested_model = parser.str("model") or None
-    seed_value = parser.get("seed")
-    if seed_value is None:
-        seed_value = -1
+    raw_seed = parser.get("seed")
+    seed_value = raw_seed if raw_seed is not None else -1
 
     payload = dict(
         prompt=parser.str("prompt"),
