@@ -76,20 +76,37 @@ WORKDIR /app
 COPY . /app/
 
 # ==================== Python dependencies ====================
-# Install ACE-Step deps (pins torch==2.10.0+cu128 for Linux x86_64), the
-# RunPod SDK, and the bundled nano-vllm (enables the optional "vllm" LM
-# backend). flash-attn compiles from source here — expect a long first build.
-RUN python -m pip install --upgrade pip setuptools wheel \
-    && python -m pip install -r requirements.txt \
-    && python -m pip install -e acestep/third_parts/nano-vllm || true
+RUN python -m pip install --upgrade pip setuptools wheel packaging ninja
+
+# Install ACE-Step deps (pins torch==2.10.0+cu128 for Linux x86_64) + RunPod SDK.
+#
+# flash-attn is INTENTIONALLY EXCLUDED here. Its build script imports torch,
+# but pip build-isolation hides torch during the build, so it fails with
+# "ModuleNotFoundError: No module named 'torch'" and aborts the whole install.
+# It is only an optional speedup — every flash_attn import in the codebase is
+# guarded by try/except ImportError and falls back to PyTorch SDPA. Dropping it
+# makes the build fast and reliable. (To add it later: install torch first,
+# then `pip install flash-attn --no-build-isolation`.)
+#
+# NOTE: no `|| true` here — a dependency failure MUST fail the build instead of
+# silently pushing a broken image.
+RUN grep -ivE '^flash-attn' requirements.txt > /tmp/requirements.runpod.txt \
+    && python -m pip install -r /tmp/requirements.runpod.txt
+
+# Optional: nano-vllm enables the "vllm" LM backend. Best-effort only — the
+# default backend is "pt", so a failure here must NOT break the image.
+RUN python -m pip install --no-build-isolation -e acestep/third_parts/nano-vllm \
+    || echo "WARN: nano-vllm not installed (vllm backend unavailable; pt backend still works)"
 
 # Persist model cache outside the (ephemeral) layer when a network volume is
 # mounted at /runpod-volume; otherwise weights land in /app/checkpoints.
 RUN mkdir -p /app/checkpoints /app/output
 
 # ==================== Sanity check ====================
-# Fail the build early if the handler has syntax/structure errors.
-RUN python -c "import ast,sys; ast.parse(open('rp_handler.py').read()); print('rp_handler.py: syntax OK')"
+# Real import check — this would have caught the previous broken build where
+# pip installed nothing. Importing torch/runpod does NOT require a GPU.
+RUN python -c "import ast; ast.parse(open('rp_handler.py').read())" \
+    && python -c "import torch, runpod, soundfile, transformers, diffusers; print('deps OK — torch', torch.__version__)"
 
 # ==================== Entrypoint ====================
 # RunPod invokes the handler defined here; rp_handler.py loads models once at
