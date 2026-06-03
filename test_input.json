@@ -1,0 +1,10 @@
+{
+  "input": {
+    "prompt": "lofi hip hop, mellow electric piano, soft vinyl crackle, relaxed boom-bap drums, 75 bpm",
+    "lyrics": "[Instrumental]",
+    "duration": 15,
+    "steps": 8,
+    "seed": 42,
+    "audio_format": "wav"
+  }
+}

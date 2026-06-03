@@ -57,3 +57,6 @@ xxhash
 
 # Local package - install with: pip install -e acestep/third_parts/nano-vllm
 # nano-vllm
+
+# RunPod Serverless SDK (queue-based worker runtime + rp_handler.py)
+runpod>=1.7.0
