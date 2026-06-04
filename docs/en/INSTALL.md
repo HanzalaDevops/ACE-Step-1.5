@@ -644,20 +644,24 @@ python -m acestep.model_downloader                    # Download main model
 python -m acestep.model_downloader --all              # Download all models
 ```
 
-### Manual Download (huggingface-cli)
+### Manual Download (hf CLI)
 
 ```bash
+# The `hf` command ships with huggingface_hub (>= 1.0). On older versions the
+# equivalent command was `huggingface-cli`, which has since been removed.
+pip install -U "huggingface_hub>=1.0"
+
 # Main model (vae, Qwen3-Embedding-0.6B, acestep-v15-turbo, acestep-5Hz-lm-1.7B)
-huggingface-cli download ACE-Step/Ace-Step1.5 --local-dir ./checkpoints
+hf download ACE-Step/Ace-Step1.5 --local-dir ./checkpoints
 
 # Optional LM models
-huggingface-cli download ACE-Step/acestep-5Hz-lm-0.6B --local-dir ./checkpoints/acestep-5Hz-lm-0.6B
-huggingface-cli download ACE-Step/acestep-5Hz-lm-4B --local-dir ./checkpoints/acestep-5Hz-lm-4B
+hf download ACE-Step/acestep-5Hz-lm-0.6B --local-dir ./checkpoints/acestep-5Hz-lm-0.6B
+hf download ACE-Step/acestep-5Hz-lm-4B --local-dir ./checkpoints/acestep-5Hz-lm-4B
 
 # XL (4B) DiT models - requires ≥12GB VRAM (with offload)
-huggingface-cli download ACE-Step/acestep-v15-xl-base --local-dir ./checkpoints/acestep-v15-xl-base
-huggingface-cli download ACE-Step/acestep-v15-xl-sft --local-dir ./checkpoints/acestep-v15-xl-sft
-huggingface-cli download ACE-Step/acestep-v15-xl-turbo --local-dir ./checkpoints/acestep-v15-xl-turbo
+hf download ACE-Step/acestep-v15-xl-base --local-dir ./checkpoints/acestep-v15-xl-base
+hf download ACE-Step/acestep-v15-xl-sft --local-dir ./checkpoints/acestep-v15-xl-sft
+hf download ACE-Step/acestep-v15-xl-turbo --local-dir ./checkpoints/acestep-v15-xl-turbo
 ```
 
 ### Shared Model Directory

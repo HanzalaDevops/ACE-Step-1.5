@@ -501,15 +501,18 @@ uv run acestep-download --model acestep-v15-sft       # 指定模型
 uv run acestep-download --list                        # 列出所有可用模型
 ```
 
-### 手动下载 (huggingface-cli)
+### 手动下载 (hf CLI)
 
 ```bash
+# `hf` 命令随 huggingface_hub (>= 1.0) 一起提供。旧版本的 `huggingface-cli` 已被移除。
+pip install -U "huggingface_hub>=1.0"
+
 # 主模型
-huggingface-cli download ACE-Step/Ace-Step1.5 --local-dir ./checkpoints
+hf download ACE-Step/Ace-Step1.5 --local-dir ./checkpoints
 
 # 可选模型
-huggingface-cli download ACE-Step/acestep-5Hz-lm-0.6B --local-dir ./checkpoints/acestep-5Hz-lm-0.6B
-huggingface-cli download ACE-Step/acestep-5Hz-lm-4B --local-dir ./checkpoints/acestep-5Hz-lm-4B
+hf download ACE-Step/acestep-5Hz-lm-0.6B --local-dir ./checkpoints/acestep-5Hz-lm-0.6B
+hf download ACE-Step/acestep-5Hz-lm-4B --local-dir ./checkpoints/acestep-5Hz-lm-4B
 ```
 
 ### 共享模型目录

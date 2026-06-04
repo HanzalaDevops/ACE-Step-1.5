@@ -501,15 +501,19 @@ uv run acestep-download --model acestep-v15-sft       # 特定のモデル
 uv run acestep-download --list                        # 利用可能な全モデルを一覧表示
 ```
 
-### 手動ダウンロード (huggingface-cli)
+### 手動ダウンロード (hf CLI)
 
 ```bash
+# `hf` コマンドは huggingface_hub (>= 1.0) に同梱されています。
+# 旧バージョンの `huggingface-cli` は削除されました。
+pip install -U "huggingface_hub>=1.0"
+
 # メインモデル（vae, Qwen3-Embedding-0.6B, acestep-v15-turbo, acestep-5Hz-lm-1.7B）
-huggingface-cli download ACE-Step/Ace-Step1.5 --local-dir ./checkpoints
+hf download ACE-Step/Ace-Step1.5 --local-dir ./checkpoints
 
 # オプションモデル
-huggingface-cli download ACE-Step/acestep-5Hz-lm-0.6B --local-dir ./checkpoints/acestep-5Hz-lm-0.6B
-huggingface-cli download ACE-Step/acestep-5Hz-lm-4B --local-dir ./checkpoints/acestep-5Hz-lm-4B
+hf download ACE-Step/acestep-5Hz-lm-0.6B --local-dir ./checkpoints/acestep-5Hz-lm-0.6B
+hf download ACE-Step/acestep-5Hz-lm-4B --local-dir ./checkpoints/acestep-5Hz-lm-4B
 ```
 
 ### 共有モデルディレクトリ

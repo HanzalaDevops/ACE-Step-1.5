@@ -882,9 +882,10 @@ Shared checkpoints directory:
   Set ACESTEP_CHECKPOINTS_DIR to share models across multiple installations:
   export ACESTEP_CHECKPOINTS_DIR=~/ace-step-models
 
-Alternative using huggingface-cli:
-  huggingface-cli download ACE-Step/Ace-Step1.5 --local-dir ./checkpoints
-  huggingface-cli download ACE-Step/acestep-5Hz-lm-0.6B --local-dir ./checkpoints/acestep-5Hz-lm-0.6B
+Alternative using the hf CLI (ships with huggingface_hub >= 1.0; the older
+huggingface-cli command has been removed):
+  hf download ACE-Step/Ace-Step1.5 --local-dir ./checkpoints
+  hf download ACE-Step/acestep-5Hz-lm-0.6B --local-dir ./checkpoints/acestep-5Hz-lm-0.6B
         """
     )
     

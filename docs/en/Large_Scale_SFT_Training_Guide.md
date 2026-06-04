@@ -38,8 +38,8 @@ cd ACE-Step-1.5
 # Install dependencies
 pip install -r requirements.txt
 
-# Ensure Hugging Face CLI is installed
-pip install huggingface_hub[cli]
+# Ensure the Hugging Face CLI (`hf`) is installed
+pip install -U "huggingface_hub>=1.0"
 ```
 
 ### Storage Requirements
@@ -63,21 +63,21 @@ mkdir -p muse_dataset/{audio,metadata}
 cd muse_dataset
 
 # Download metadata files
-huggingface-cli download bolshyC/Muse \
+hf download bolshyC/Muse \
     train_cn.jsonl train_en.jsonl \
     validation_cn.jsonl validation_en.jsonl \
     --local-dir ./metadata --repo-type dataset
 
 # Download Chinese audio archives (25 parts)
 for i in $(seq -w 1 25); do
-    huggingface-cli download bolshyC/Muse \
+    hf download bolshyC/Muse \
         "cn_part${i}_of_025.tar" \
         --local-dir ./audio --repo-type dataset
 done
 
 # Download English audio archives (35 parts)
 for i in $(seq -w 1 35); do
-    huggingface-cli download bolshyC/Muse \
+    hf download bolshyC/Muse \
         "en_part${i}_of_035.tar" \
         --local-dir ./audio --repo-type dataset
 done
