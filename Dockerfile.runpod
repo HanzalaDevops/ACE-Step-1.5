@@ -4,8 +4,10 @@
 #
 # Builds a queue-based RunPod Serverless endpoint that runs rp_handler.py.
 # RunPod detects `runpod.serverless.start({"handler": handler})` and routes
-# jobs to the handler. Model weights download from HuggingFace on first
-# cold-start (honours HF_TOKEN for gated repos).
+# jobs to the handler. The core ACE-Step 1.5 weights are baked INTO the image
+# at build time (see "Bake model weights" below) and served from
+# /app/checkpoints, so cold-starts never download from HuggingFace. HF_TOKEN is
+# only needed at build time for gated-repo access.
 #
 # RunPod GitHub integration:
 #   - Repo: HanzalaDevops/ACE-Step-1.5
@@ -31,10 +33,13 @@ ARG BASE_IMAGE=runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
 FROM ${BASE_IMAGE}
 
 # ==================== Build args / secrets ====================
-# HF_TOKEN is accepted at build time for gated model access. It is also
-# persisted to the runtime environment so first-run downloads can authenticate.
-# For production, prefer setting HF_TOKEN as an endpoint secret in the RunPod
-# console rather than baking it into the image.
+# HF_TOKEN is accepted at build time ONLY to authenticate the model download
+# below (gated repos). It is intentionally NOT persisted into the runtime
+# environment: the weights are baked into the image, so the worker never
+# downloads at runtime and never needs the token. Keeping the credential out of
+# the final image ENV means it cannot leak via `docker inspect` or a shell in a
+# running container. For production, pass it as `--build-arg HF_TOKEN=...` (or a
+# BuildKit secret) rather than committing it anywhere.
 ARG HF_TOKEN=""
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -43,9 +48,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    # Persisted so runtime HF downloads can use the gated token.
-    HF_TOKEN=${HF_TOKEN} \
-    HUGGING_FACE_HUB_TOKEN=${HF_TOKEN} \
+    # Rust-based accelerator for the build-time HuggingFace download.
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    # Serve the weights baked into the image. Do NOT default to /runpod-volume
+    # in serverless — cold-starts must not depend on a mounted network volume.
+    ACESTEP_CHECKPOINTS_DIR=/app/checkpoints \
     # ACE-Step worker defaults (override per-endpoint in the RunPod console).
     CHECKPOINT_PATH=ACE-Step/Ace-Step1.5 \
     ACESTEP_CONFIG_PATH=acestep-v15-turbo \
@@ -70,6 +77,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libsndfile1 \
         libsndfile1-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# ==================== Bake model weights into the image ====================
+# Download the core ACE-Step 1.5 weights at BUILD time so cold-starts never hit
+# HuggingFace. This runs BEFORE `COPY . /app/` so editing source code does not
+# bust the multi-GB weights layer; `checkpoints/` is .dockerignore'd, so the
+# COPY below never overwrites what we bake here.
+#
+# Security: HF_TOKEN is passed inline to the download command only. It is never
+# echoed to the build log (Docker logs the literal `$HF_TOKEN`, not its value),
+# never written to a token file (no `huggingface-cli login`), and never set in
+# the runtime ENV — so the final image carries no credential.
+RUN python -m pip install -U "huggingface_hub[cli]" hf_transfer \
+    && mkdir -p /app/checkpoints \
+    && if [ -n "$HF_TOKEN" ]; then \
+         echo "HF_TOKEN provided — authenticating download for gated repo"; \
+       else \
+         echo "No HF_TOKEN — downloading public weights anonymously"; \
+       fi \
+    && HF_TOKEN="$HF_TOKEN" HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" \
+       huggingface-cli download ACE-Step/Ace-Step1.5 \
+         --local-dir /app/checkpoints \
+         --local-dir-use-symlinks False \
+    && echo "Baked checkpoints into image:" && ls -1 /app/checkpoints | head
 
 # ==================== Project source ====================
 WORKDIR /app
@@ -98,8 +128,8 @@ RUN grep -ivE '^flash-attn' requirements.txt > /tmp/requirements.runpod.txt \
 RUN python -m pip install --no-build-isolation -e acestep/third_parts/nano-vllm \
     || echo "WARN: nano-vllm not installed (vllm backend unavailable; pt backend still works)"
 
-# Persist model cache outside the (ephemeral) layer when a network volume is
-# mounted at /runpod-volume; otherwise weights land in /app/checkpoints.
+# Weights are already baked into /app/checkpoints above; this just guarantees
+# the output dir exists (and is a no-op for checkpoints if it already does).
 RUN mkdir -p /app/checkpoints /app/output
 
 # ==================== Sanity check ====================

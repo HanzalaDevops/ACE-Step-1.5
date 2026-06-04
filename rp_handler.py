@@ -69,6 +69,11 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 # acestep's get_project_root() reads this to locate the checkpoints directory.
 os.environ.setdefault("ACESTEP_PROJECT_ROOT", _PROJECT_ROOT)
+# Serverless ALWAYS prefers the weights baked into the image at /app/checkpoints
+# (see Dockerfile.runpod). setdefault honours an explicit override — e.g. a
+# network volume — when one is supplied, but otherwise pins the in-image dir so
+# get_checkpoints_dir() resolves there and never re-downloads on cold-start.
+os.environ.setdefault("ACESTEP_CHECKPOINTS_DIR", "/app/checkpoints")
 
 from loguru import logger  # noqa: E402  (after env setup, before heavy imports)
 
@@ -146,6 +151,32 @@ def _apply_checkpoint_repo_override() -> None:
         logger.warning("[rp_handler] Could not apply CHECKPOINT_PATH override: {}", exc)
 
 
+def _log_checkpoints_presence(checkpoint_dir: str) -> bool:
+    """Log whether weights already exist locally and return that fact.
+
+    A non-empty checkpoints directory means the image-baked weights are present,
+    so the upstream loader will find them and skip any HuggingFace download. When
+    the directory is missing/empty we only warn — the loader is still allowed to
+    download as a fallback so a misbuilt image degrades instead of hard-failing.
+    """
+    try:
+        has_weights = os.path.isdir(checkpoint_dir) and any(os.scandir(checkpoint_dir))
+    except OSError:
+        has_weights = False
+
+    if has_weights:
+        logger.info(
+            "[rp_handler] Local checkpoints present at {} — no download needed.",
+            checkpoint_dir,
+        )
+    else:
+        logger.warning(
+            "[rp_handler] No local checkpoints at {} — upstream download will run.",
+            checkpoint_dir,
+        )
+    return has_weights
+
+
 def _load_models() -> None:
     """Cold-start: load the DiT pipeline and (optionally) the 5Hz LM exactly once."""
     global _dit_handler, _llm_handler, _lm_available, _models_ready, _load_error
@@ -182,6 +213,7 @@ def _load_models() -> None:
         checkpoint_dir = str(get_checkpoints_dir())
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger.info("[rp_handler] Checkpoints directory: {}", checkpoint_dir)
+        _log_checkpoints_presence(checkpoint_dir)
 
         # ---- DiT pipeline (downloads weights on first run) ----
         logger.info("[rp_handler] Initializing DiT pipeline...")
