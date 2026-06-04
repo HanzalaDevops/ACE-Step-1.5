@@ -95,11 +95,13 @@ RUN python -m pip install -U "huggingface_hub[cli]" hf_transfer \
        else \
          echo "No HF_TOKEN — downloading public weights anonymously"; \
        fi \
-    && HF_TOKEN="$HF_TOKEN" HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" \
-       huggingface-cli download ACE-Step/Ace-Step1.5 \
-         --local-dir /app/checkpoints \
-         --local-dir-use-symlinks False \
-    && echo "Baked checkpoints into image:" && ls -1 /app/checkpoints | head
+    && export HF_TOKEN="$HF_TOKEN" HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" \
+    && ( huggingface-cli download ACE-Step/Ace-Step1.5 --local-dir /app/checkpoints \
+         || ( echo "Accelerated download failed — retrying without hf_transfer" \
+              && HF_HUB_ENABLE_HF_TRANSFER=0 \
+                 huggingface-cli download ACE-Step/Ace-Step1.5 --local-dir /app/checkpoints ) ) \
+    && echo "Baked checkpoints into image (top-level):" \
+    && ls -1 /app/checkpoints
 
 # ==================== Project source ====================
 WORKDIR /app
