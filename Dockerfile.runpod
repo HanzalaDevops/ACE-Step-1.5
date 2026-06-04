@@ -48,8 +48,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    # Rust-based accelerator for the build-time HuggingFace download.
-    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    # Xet-based high-performance accelerator for the build-time HF download
+    # (replaces the deprecated HF_HUB_ENABLE_HF_TRANSFER / hf_transfer path).
+    HF_XET_HIGH_PERFORMANCE=1 \
     # Serve the weights baked into the image. Do NOT default to /runpod-volume
     # in serverless — cold-starts must not depend on a mounted network volume.
     ACESTEP_CHECKPOINTS_DIR=/app/checkpoints \
@@ -86,9 +87,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #
 # Security: HF_TOKEN is passed inline to the download command only. It is never
 # echoed to the build log (Docker logs the literal `$HF_TOKEN`, not its value),
-# never written to a token file (no `huggingface-cli login`), and never set in
+# never written to a token file (no `hf auth login`), and never set in
 # the runtime ENV — so the final image carries no credential.
-RUN python -m pip install -U "huggingface_hub[cli]" hf_transfer \
+#
+# NOTE: `huggingface-cli` was removed in huggingface_hub >= 1.0 (it now errors
+# out with "deprecated and no longer works"). The current entrypoint is `hf`,
+# which ships with the base package, and high-performance transfer is enabled
+# via HF_XET_HIGH_PERFORMANCE (hf_transfer / HF_HUB_ENABLE_HF_TRANSFER are
+# likewise deprecated and ignored).
+RUN python -m pip install -U "huggingface_hub>=1.0" \
     && mkdir -p /app/checkpoints \
     && if [ -n "$HF_TOKEN" ]; then \
          echo "HF_TOKEN provided — authenticating download for gated repo"; \
@@ -96,10 +103,10 @@ RUN python -m pip install -U "huggingface_hub[cli]" hf_transfer \
          echo "No HF_TOKEN — downloading public weights anonymously"; \
        fi \
     && export HF_TOKEN="$HF_TOKEN" HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" \
-    && ( huggingface-cli download ACE-Step/Ace-Step1.5 --local-dir /app/checkpoints \
-         || ( echo "Accelerated download failed — retrying without hf_transfer" \
-              && HF_HUB_ENABLE_HF_TRANSFER=0 \
-                 huggingface-cli download ACE-Step/Ace-Step1.5 --local-dir /app/checkpoints ) ) \
+    && ( HF_XET_HIGH_PERFORMANCE=1 hf download ACE-Step/Ace-Step1.5 --local-dir /app/checkpoints \
+         || ( echo "Accelerated download failed — retrying without Xet high-performance" \
+              && HF_XET_HIGH_PERFORMANCE=0 \
+                 hf download ACE-Step/Ace-Step1.5 --local-dir /app/checkpoints ) ) \
     && echo "Baked checkpoints into image (top-level):" \
     && ls -1 /app/checkpoints
 
