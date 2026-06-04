@@ -314,9 +314,14 @@ def _parse_job_input(job_input: Dict[str, Any]) -> Dict[str, Any]:
 
     seed = _coerce_int(job_input.get("seed"), -1)
 
-    audio_format = str(job_input.get("audio_format", "wav")).strip().lower()
+    # Default to MP3: a 120s 48 kHz stereo WAV is ~22 MB (~30 MB as base64),
+    # which exceeds RunPod's /job-done response-size limit and gets rejected
+    # with HTTP 400. MP3 keeps the inline base64 a few MB so the result is
+    # actually accepted. Clients can still ask for "flac" (lossless, ~2x WAV)
+    # or "wav" (only safe for short clips).
+    audio_format = str(job_input.get("audio_format", "mp3")).strip().lower()
     if audio_format not in ("wav", "mp3", "flac"):
-        audio_format = "wav"
+        audio_format = "mp3"
 
     # Thinking mode only works when the LM is loaded; auto-disable otherwise.
     thinking = bool(job_input.get("thinking", True)) and _lm_available
@@ -340,8 +345,23 @@ def _parse_job_input(job_input: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Audio encoding
 # ---------------------------------------------------------------------------
-def _tensor_to_wav_bytes(audio_tensor, sample_rate: int) -> bytes:
-    """Encode a CPU float32 tensor [channels, samples] to in-memory WAV (PCM_16)."""
+# Requested audio_format -> (soundfile format, subtype). MP3 needs libsndfile
+# >= 1.1; FLAC and WAV are available on every libsndfile build, so they make
+# safe fallbacks if the container's encoder can't honor the request.
+_AUDIO_FORMAT_MAP = {
+    "wav": ("WAV", "PCM_16"),
+    "flac": ("FLAC", None),
+    "mp3": ("MP3", None),
+}
+
+
+def _tensor_to_audio_bytes(audio_tensor, sample_rate: int, audio_format: str):
+    """Encode a CPU float32 tensor [channels, samples] to in-memory audio bytes.
+
+    Returns (bytes, actual_format). Tries the requested format first, then
+    degrades to FLAC and finally WAV so a job never fails purely because the
+    container's libsndfile lacks a particular encoder.
+    """
     import numpy as np
     import soundfile as sf
 
@@ -353,24 +373,53 @@ def _tensor_to_wav_bytes(audio_tensor, sample_rate: int) -> bytes:
         array = array.T
     array = np.clip(array, -1.0, 1.0)
 
-    buffer = io.BytesIO()
-    sf.write(buffer, array, samplerate=int(sample_rate), format="WAV", subtype="PCM_16")
-    return buffer.getvalue()
+    # De-duplicate the fallback chain while preserving order.
+    candidates = list(dict.fromkeys([audio_format, "flac", "wav"]))
+    for fmt in candidates:
+        sf_format, sf_subtype = _AUDIO_FORMAT_MAP.get(fmt, ("WAV", "PCM_16"))
+        try:
+            buffer = io.BytesIO()
+            sf.write(
+                buffer,
+                array,
+                samplerate=int(sample_rate),
+                format=sf_format,
+                subtype=sf_subtype,
+            )
+            return buffer.getvalue(), fmt
+        except Exception as exc:
+            logger.warning("[encode] {} encoding failed ({}); trying fallback.", fmt, exc)
+    raise RuntimeError("no available audio encoder (wav/flac/mp3 all failed)")
 
 
-def _encode_audio_dict(audio_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """Turn one pipeline audio dict into a base64 WAV payload."""
+def _encode_audio_dict(audio_dict: Dict[str, Any], audio_format: str = "mp3") -> Dict[str, Any]:
+    """Turn one pipeline audio dict into a base64 audio payload.
+
+    Defaults to a compressed format so the inline base64 stays under RunPod's
+    /job-done response-size limit; raw WAV of a long clip exceeds it and the
+    platform rejects the result with HTTP 400.
+    """
     tensor = audio_dict.get("tensor")
     sample_rate = int(audio_dict.get("sample_rate") or 48000)
     if tensor is None:
         raise RuntimeError("generation produced no audio tensor")
 
-    wav_bytes = _tensor_to_wav_bytes(tensor, sample_rate)
+    audio_bytes, actual_format = _tensor_to_audio_bytes(tensor, sample_rate, audio_format)
+    audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
     num_samples = tensor.shape[-1]
+
+    # Log payload size so any future oversize 400 is trivial to diagnose.
+    logger.info(
+        "[encode] format={} bytes={} base64_len={} (~{:.2f} MB)",
+        actual_format,
+        len(audio_bytes),
+        len(audio_b64),
+        len(audio_b64) / 1_048_576,
+    )
     return {
-        "audio_base64": base64.b64encode(wav_bytes).decode("ascii"),
+        "audio_base64": audio_b64,
         "sample_rate": sample_rate,
-        "format": "wav",
+        "format": actual_format,
         "duration_seconds": round(num_samples / float(sample_rate), 2),
         "key": audio_dict.get("key", ""),
     }
@@ -444,7 +493,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             logger.error("[rp_handler] job {} failed: {}", job_id, msg)
             return {"error": f"generation failed: {msg}"}
 
-        payload = _encode_audio_dict(result.audios[0])
+        payload = _encode_audio_dict(result.audios[0], params_in["audio_format"])
         seed_used = result.audios[0].get("params", {}).get("seed", params_in["seed"])
         payload.update(
             {
