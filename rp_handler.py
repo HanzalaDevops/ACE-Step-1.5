@@ -171,8 +171,17 @@ def _load_models() -> None:
         from acestep.llm_inference import LLMHandler
 
         prefer_source = None if DOWNLOAD_SOURCE in ("", "auto") else DOWNLOAD_SOURCE
-        checkpoint_dir = os.path.join(_PROJECT_ROOT, "checkpoints")
+
+        # Resolve the checkpoints directory the SAME way the DiT pipeline does:
+        # ACESTEP_CHECKPOINTS_DIR (e.g. a network volume at /runpod-volume/checkpoints)
+        # wins over the in-image <project_root>/checkpoints fallback. Without this,
+        # the LM below would re-download to the ephemeral layer on every cold-start
+        # even when the DiT weights are served from a persistent volume.
+        from acestep.model_downloader import get_checkpoints_dir
+
+        checkpoint_dir = str(get_checkpoints_dir())
         os.makedirs(checkpoint_dir, exist_ok=True)
+        logger.info("[rp_handler] Checkpoints directory: {}", checkpoint_dir)
 
         # ---- DiT pipeline (downloads weights on first run) ----
         logger.info("[rp_handler] Initializing DiT pipeline...")
