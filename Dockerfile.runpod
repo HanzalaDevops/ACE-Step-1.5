@@ -42,6 +42,23 @@ FROM ${BASE_IMAGE}
 # BuildKit secret) rather than committing it anywhere.
 ARG HF_TOKEN=""
 
+# Which DiT (diffusion) model to bake into the image. Defaults to the base
+# model. It is its OWN HuggingFace repo (ACE-Step/<name>) — NOT bundled in the
+# main ACE-Step/Ace-Step1.5 repo — so it must be downloaded separately at build
+# time (see "Bake model weights" below). The runtime ACESTEP_CONFIG_PATH is tied
+# to this value so the worker loads exactly what was baked and never downloads it
+# again on cold-start. Override per build:
+#   docker build --build-arg DIT_MODEL=acestep-v15-sft ...
+ARG DIT_MODEL=acestep-v15-base
+
+# Which 5Hz LM (Chain-of-Thought / "thinking") to bake. The 1.7B is bundled in
+# the main repo; the 0.6B and 4B are SEPARATE repos (ACE-Step/<name>). The LM
+# loader does NOT auto-download — it only checks <checkpoints>/<LM_MODEL> and, if
+# missing, silently falls back to pure-DiT (thinking disabled). So a non-1.7B LM
+# MUST be baked here. Tied to runtime ACESTEP_LM_MODEL_PATH. Override per build:
+#   docker build --build-arg LM_MODEL=acestep-5Hz-lm-1.7B ...
+ARG LM_MODEL=acestep-5Hz-lm-4B
+
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
@@ -56,8 +73,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     ACESTEP_CHECKPOINTS_DIR=/app/checkpoints \
     # ACE-Step worker defaults (override per-endpoint in the RunPod console).
     CHECKPOINT_PATH=ACE-Step/Ace-Step1.5 \
-    ACESTEP_CONFIG_PATH=acestep-v15-turbo \
-    ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-1.7B \
+    ACESTEP_CONFIG_PATH=${DIT_MODEL} \
+    ACESTEP_LM_MODEL_PATH=${LM_MODEL} \
     ACESTEP_LM_BACKEND=pt \
     ACESTEP_DEVICE=auto \
     ACESTEP_INIT_LLM=true \
@@ -80,10 +97,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ==================== Bake model weights into the image ====================
-# Download the core ACE-Step 1.5 weights at BUILD time so cold-starts never hit
-# HuggingFace. This runs BEFORE `COPY . /app/` so editing source code does not
-# bust the multi-GB weights layer; `checkpoints/` is .dockerignore'd, so the
-# COPY below never overwrites what we bake here.
+# Download ALL weights the worker needs at BUILD time so cold-starts never hit
+# HuggingFace:
+#   1. ACE-Step/Ace-Step1.5 (main repo)  -> vae, text encoder, turbo DiT, 1.7B LM
+#   2. ACE-Step/${DIT_MODEL}             -> the configured DiT (e.g. base) — a
+#      SEPARATE repo. The DiT loader auto-downloads it at cold-start when missing,
+#      so without baking it re-downloads on every new worker's ephemeral layer.
+#   3. ACE-Step/${LM_MODEL}              -> the configured 5Hz LM (e.g. 4B) — also
+#      a SEPARATE repo. The LM loader does NOT auto-download; if missing it
+#      silently falls back to pure-DiT and disables thinking mode. Baking is the
+#      only way to make a non-1.7B LM available on every worker.
+# Each step skips automatically when the model is already present (e.g. bundled
+# in the main repo), so every worker reuses the image-layer copy and never
+# re-downloads on cold-start.
+# This runs BEFORE `COPY . /app/` so editing source code does not bust the
+# multi-GB weights layer; `checkpoints/` is .dockerignore'd, so the COPY below
+# never overwrites what we bake here.
 #
 # Security: HF_TOKEN is passed inline to the download command only. It is never
 # echoed to the build log (Docker logs the literal `$HF_TOKEN`, not its value),
@@ -107,6 +136,24 @@ RUN python -m pip install -U "huggingface_hub>=1.0" \
          || ( echo "Accelerated download failed — retrying without Xet high-performance" \
               && HF_XET_HIGH_PERFORMANCE=0 \
                  hf download ACE-Step/Ace-Step1.5 --local-dir /app/checkpoints ) ) \
+    && echo "Baking DiT model: ${DIT_MODEL}" \
+    && if [ -n "$(ls -A "/app/checkpoints/${DIT_MODEL}" 2>/dev/null)" ]; then \
+         echo "DiT '${DIT_MODEL}' already present from main repo — skipping submodel download"; \
+       else \
+         ( HF_XET_HIGH_PERFORMANCE=1 hf download "ACE-Step/${DIT_MODEL}" --local-dir "/app/checkpoints/${DIT_MODEL}" \
+           || ( echo "Accelerated download failed — retrying without Xet high-performance" \
+                && HF_XET_HIGH_PERFORMANCE=0 \
+                   hf download "ACE-Step/${DIT_MODEL}" --local-dir "/app/checkpoints/${DIT_MODEL}" ) ); \
+       fi \
+    && echo "Baking 5Hz LM: ${LM_MODEL}" \
+    && if [ -n "$(ls -A "/app/checkpoints/${LM_MODEL}" 2>/dev/null)" ]; then \
+         echo "LM '${LM_MODEL}' already present from main repo — skipping submodel download"; \
+       else \
+         ( HF_XET_HIGH_PERFORMANCE=1 hf download "ACE-Step/${LM_MODEL}" --local-dir "/app/checkpoints/${LM_MODEL}" \
+           || ( echo "Accelerated download failed — retrying without Xet high-performance" \
+                && HF_XET_HIGH_PERFORMANCE=0 \
+                   hf download "ACE-Step/${LM_MODEL}" --local-dir "/app/checkpoints/${LM_MODEL}" ) ); \
+       fi \
     && echo "Baked checkpoints into image (top-level):" \
     && ls -1 /app/checkpoints
 
