@@ -130,7 +130,10 @@ OFFLOAD_TO_CPU = os.environ.get("ACESTEP_OFFLOAD_TO_CPU", "false").strip().lower
 DOWNLOAD_SOURCE = os.environ.get("ACESTEP_DOWNLOAD_SOURCE", "huggingface").strip().lower()
 
 # Generation defaults / safety bounds.
-DEFAULT_STEPS = int(os.environ.get("ACESTEP_DEFAULT_STEPS", "8"))
+# Default steps suit the BASE DiT (acestep-v15-base), which needs many more
+# steps than the distilled turbo model (~8) for good audio quality. Override
+# with ACESTEP_DEFAULT_STEPS=8 on the endpoint if you switch to a turbo DiT.
+DEFAULT_STEPS = int(os.environ.get("ACESTEP_DEFAULT_STEPS", "60"))
 DEFAULT_DURATION = float(os.environ.get("ACESTEP_DEFAULT_DURATION", "-1"))
 MAX_DURATION = float(os.environ.get("ACESTEP_MAX_DURATION", "600"))
 MAX_STEPS = int(os.environ.get("ACESTEP_MAX_STEPS", "200"))
