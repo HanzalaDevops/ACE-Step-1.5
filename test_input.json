@@ -1,10 +1,16 @@
 {
   "input": {
-    "prompt": "lofi hip hop, mellow electric piano, soft vinyl crackle, relaxed boom-bap drums, 75 bpm",
-    "lyrics": "[Instrumental]",
-    "duration": 15,
-    "steps": 8,
-    "seed": 42,
-    "audio_format": "wav"
+    "prompt": "modern Punjabi romantic song, AP Dhillon style, cinematic",
+    "lyrics": "[Verse 1]\nTeri hasi da nasha...\n[Chorus]\nRaatan teri yaadan...",
+    "vocal_language": "hi",
+    "instrumental": false,
+    "duration": 180,
+    "steps": 60,
+    "seed": -1,
+    "audio_format": "mp3",
+    "thinking": true,
+    "guidance_scale": 7.0,
+    "bpm": 102,
+    "keyscale": "D Major"
   }
 }

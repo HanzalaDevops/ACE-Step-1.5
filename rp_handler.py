@@ -14,14 +14,31 @@ Lifecycle
 
 Job input schema (``job["input"]``)
 ------------------------------------
-    prompt   (str)            caption / text description of the music. Required.
-    lyrics   (str)            lyrics text. Optional. "[Instrumental]" for no vocals.
-    duration (float)          target length in seconds (10-600). Optional (-1 = auto).
-    steps    (int)            diffusion inference steps (turbo: ~8). Optional.
-    seed     (int)            RNG seed. Optional (-1 = random).
-    audio_format (str)        "wav" (default) | "mp3" | "flac".
+The worker accepts the **full ACE-Step generation contract** — the same field
+names and aliases as the FastAPI ``/release_task`` endpoint. Parsing/mapping is
+delegated to the canonical helpers (``RequestParser`` ->
+``build_generate_music_request`` -> ``build_generation_setup``) so the serverless
+and HTTP surfaces never drift. Highlights (see ``release_task_models.py`` for the
+complete list and ``release_task_param_parser.PARAM_ALIASES`` for every alias):
+
+    prompt / caption (str)    music description. Required unless sample_mode.
+    lyrics   (str)            lyrics; "[Instrumental]" for no vocals.
     instrumental (bool)       force instrumental output.
-    thinking (bool)           enable 5Hz-LM CoT reasoning (requires LM loaded).
+    audio_duration (float)    target seconds (10-600); aliases duration/target_duration. -1 = auto.
+    audio_format (str)        mp3 (default) | wav | wav32 | flac | opus. (aac -> mp3 in-worker.)
+    batch_size (int)          1..8 tracks; extra tracks returned under "audios".
+    seed / use_random_seed    reproducibility controls.
+    thinking (bool)           5Hz-LM CoT (auto-disabled if the LM did not load).
+    sample_mode / sample_query / use_format   LM caption/lyrics authoring.
+    bpm / key_scale / time_signature / vocal_language   musical metadata.
+    inference_steps / guidance_scale / shift / infer_method / timesteps / use_adg / cfg_interval_*
+    lm_temperature / lm_cfg_scale / lm_top_k / lm_top_p / lm_repetition_penalty / lm_negative_prompt
+    use_cot_caption / use_cot_language / constrained_decoding / allow_lm_batch
+    task_type / reference_audio_path / src_audio_path / instruction / repainting_* / audio_cover_strength
+
+Cold-start-only fields (``model``, ``lm_model_path``, ``lm_backend``) cannot be
+switched per request — this worker serves the DiT/LM baked at build time — so a
+value that differs from the loaded model is ignored with a warning.
 
 Response
 --------
@@ -41,7 +58,10 @@ Response
         "key_scale": "G Major",
         "time_signature": "4",
         "vocal_language": "en",
-        "audio_duration": 180
+        "audio_duration": 180,
+        # Only present when batch_size > 1: every generated track (the top-level
+        # audio_base64/seed mirror tracks[0] for single-track back-compat).
+        "audios": [{"audio_base64": "...", "seed": 1234, ...}, ...]
     }
 
 On failure the handler returns ``{"error": "..."}`` so the RunPod client gets a
@@ -134,9 +154,15 @@ DOWNLOAD_SOURCE = os.environ.get("ACESTEP_DOWNLOAD_SOURCE", "huggingface").strip
 # steps than the distilled turbo model (~8) for good audio quality. Override
 # with ACESTEP_DEFAULT_STEPS=8 on the endpoint if you switch to a turbo DiT.
 DEFAULT_STEPS = int(os.environ.get("ACESTEP_DEFAULT_STEPS", "60"))
-DEFAULT_DURATION = float(os.environ.get("ACESTEP_DEFAULT_DURATION", "-1"))
 MAX_DURATION = float(os.environ.get("ACESTEP_MAX_DURATION", "600"))
 MAX_STEPS = int(os.environ.get("ACESTEP_MAX_STEPS", "200"))
+MAX_BATCH_SIZE = int(os.environ.get("ACESTEP_MAX_BATCH_SIZE", "8"))
+
+# 5Hz-LM sampling defaults, mirroring the FastAPI server (acestep/api_server.py)
+# so the two surfaces share one contract. Used when a request omits the field.
+LM_DEFAULT_TEMPERATURE = 0.85
+LM_DEFAULT_CFG_SCALE = 2.5
+LM_DEFAULT_TOP_P = 0.9
 
 # ---------------------------------------------------------------------------
 # Module-level model state (populated once by _load_models)
@@ -359,69 +385,142 @@ def _load_models() -> None:
 # ---------------------------------------------------------------------------
 # Input parsing & validation
 # ---------------------------------------------------------------------------
-def _coerce_float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+def _resolve_audio_format(req_format: Optional[str]) -> str:
+    """Pick the in-worker encoder format for a requested ``audio_format``.
+
+    libsndfile (used for in-memory encoding here) has no AAC encoder, so an
+    ``aac`` request is honoured as MP3 — the closest lossy format the worker can
+    actually produce. Anything unrecognised also degrades to MP3, which keeps the
+    inline base64 small enough for RunPod's /job-done response-size limit.
+    """
+    fmt = str(req_format or "mp3").strip().lower()
+    if fmt == "aac":
+        logger.warning("[rp_handler] 'aac' has no in-worker encoder; serving 'mp3' instead.")
+        return "mp3"
+    if fmt not in _AUDIO_FORMAT_MAP:
+        if fmt:
+            logger.warning("[rp_handler] unknown audio_format '{}'; serving 'mp3'.", fmt)
+        return "mp3"
+    return fmt
 
 
-def _coerce_int(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+def _warn_cold_start_only_overrides(req: Any) -> None:
+    """Warn when a request asks for a model/LM the baked worker can't switch to.
+
+    The DiT and 5Hz-LM are loaded once at cold-start (Dockerfile.runpod bakes
+    them). ``model`` / ``lm_model_path`` / ``lm_backend`` therefore cannot be
+    honoured per request — surface the mismatch loudly instead of silently
+    generating with a different model than the caller asked for.
+    """
+    model = (getattr(req, "model", None) or "").strip()
+    if model and model != DIT_CONFIG_PATH:
+        logger.warning(
+            "[rp_handler] request model='{}' ignored — this worker serves the baked DiT '{}'. "
+            "Deploy a separate endpoint to use a different model.",
+            model, DIT_CONFIG_PATH,
+        )
+    lm_path = (getattr(req, "lm_model_path", None) or "").strip()
+    if lm_path and lm_path != LM_MODEL_PATH:
+        logger.warning(
+            "[rp_handler] request lm_model_path='{}' ignored — baked LM is '{}'.",
+            lm_path, LM_MODEL_PATH,
+        )
+    lm_backend = (getattr(req, "lm_backend", None) or "").strip()
+    if lm_backend and lm_backend != LM_BACKEND:
+        logger.warning(
+            "[rp_handler] request lm_backend='{}' ignored — worker LM backend is '{}'.",
+            lm_backend, LM_BACKEND,
+        )
 
 
-def _parse_job_input(job_input: Dict[str, Any]) -> Dict[str, Any]:
-    """Validate and normalize the raw job input into generation parameters."""
+def _build_request(job_input: Dict[str, Any]) -> Any:
+    """Parse raw job input into a validated ``GenerateMusicRequest``.
+
+    Reuses the canonical alias map + request builder shared with the FastAPI
+    server so both surfaces accept exactly the same contract. Applies the
+    worker's safety envelope (duration/steps/batch clamps) and serverless-aware
+    defaults (env-tuned steps, LM-gated thinking) on top.
+    """
     if not isinstance(job_input, dict):
         raise ValueError("'input' must be a JSON object")
 
-    prompt = job_input.get("prompt") or job_input.get("caption") or ""
-    prompt = str(prompt).strip()
-    lyrics = str(job_input.get("lyrics") or "").strip()
-    instrumental = bool(job_input.get("instrumental", False))
+    from acestep.api.http.release_task_models import GenerateMusicRequest
+    from acestep.api.http.release_task_param_parser import RequestParser
+    from acestep.api.http.release_task_request_builder import build_generate_music_request
+    from acestep.constants import DEFAULT_DIT_INSTRUCTION
 
-    # A caption or lyrics is required — generating from nothing is meaningless.
-    if not prompt and not lyrics:
-        raise ValueError("at least one of 'prompt' (caption) or 'lyrics' is required")
+    parser = RequestParser(job_input)
 
-    duration = _coerce_float(job_input.get("duration"), DEFAULT_DURATION)
-    if duration > 0:
-        duration = max(10.0, min(duration, MAX_DURATION))
+    prompt = (parser.str("prompt") or "").strip()
+    lyrics = (parser.str("lyrics") or "").strip()
+    sample_mode = parser.bool("sample_mode", False)
+    sample_query = (parser.str("sample_query") or "").strip()
 
-    steps = _coerce_int(job_input.get("steps"), DEFAULT_STEPS)
-    steps = max(1, min(steps, MAX_STEPS))
+    # Need *some* intent: a caption, lyrics, or an LM authoring request.
+    if not (prompt or lyrics or sample_mode or sample_query):
+        raise ValueError(
+            "provide at least one of 'prompt' (caption), 'lyrics', or 'sample_query'/'sample_mode'"
+        )
 
-    seed = _coerce_int(job_input.get("seed"), -1)
+    # The documented `instrumental` flag is not part of the FastAPI model (which
+    # infers it from lyrics) — honour it by forcing the instrumental sentinel.
+    if parser.bool("instrumental", False) and not lyrics:
+        lyrics = "[Instrumental]"
 
-    # Default to MP3: a 120s 48 kHz stereo WAV is ~22 MB (~30 MB as base64),
-    # which exceeds RunPod's /job-done response-size limit and gets rejected
-    # with HTTP 400. MP3 keeps the inline base64 a few MB so the result is
-    # actually accepted. Clients can still ask for "flac" (lossless, ~2x WAV)
-    # or "wav" (only safe for short clips).
-    audio_format = str(job_input.get("audio_format", "mp3")).strip().lower()
-    if audio_format not in ("wav", "mp3", "flac"):
-        audio_format = "mp3"
-
-    # Thinking mode only works when the LM is loaded; auto-disable otherwise.
-    thinking = bool(job_input.get("thinking", True)) and _lm_available
-
-    return {
-        "prompt": prompt,
-        "lyrics": lyrics if lyrics else ("[Instrumental]" if instrumental else ""),
-        "instrumental": instrumental,
-        "duration": duration,
-        "steps": steps,
-        "seed": seed,
-        "audio_format": audio_format,
-        "thinking": thinking,
-        "guidance_scale": _coerce_float(job_input.get("guidance_scale"), 1.0),
-        "bpm": job_input.get("bpm"),
-        "keyscale": str(job_input.get("keyscale") or ""),
-        "vocal_language": str(job_input.get("vocal_language") or "unknown"),
+    overrides: Dict[str, Any] = {
+        # thinking defaults ON (per schema) but only when the LM actually loaded.
+        "thinking": parser.bool("thinking", True) and _lm_available,
+        "lyrics": lyrics,
     }
+
+    # When the caller omits vocal_language, default to "unknown" so the 5Hz LM
+    # auto-detects it (the shared builder would otherwise assume "en").
+    if parser.get("vocal_language") is None:
+        overrides["vocal_language"] = "unknown"
+
+    # Step count resolution, in priority order:
+    #   1. canonical `inference_steps` (handled by the shared builder),
+    #   2. the legacy `steps` key the old rp_handler accepted (back-compat),
+    #   3. the worker's env-tuned DEFAULT_STEPS (base-DiT friendly) — the shared
+    #      builder would otherwise default to the turbo value (8).
+    if parser.get("inference_steps") is None:
+        legacy_steps = job_input.get("steps")
+        if legacy_steps is not None:
+            try:
+                overrides["inference_steps"] = int(float(legacy_steps))
+            except (TypeError, ValueError):
+                overrides["inference_steps"] = DEFAULT_STEPS
+        else:
+            overrides["inference_steps"] = DEFAULT_STEPS
+
+    # Back-compat: an explicit non-negative seed implies reproducibility even if
+    # use_random_seed was not sent (the old handler keyed off seed>=0 alone).
+    if parser.get("use_random_seed") is None and parser.get("seed") is not None:
+        try:
+            if int(float(parser.get("seed"))) >= 0:
+                overrides["use_random_seed"] = False
+        except (TypeError, ValueError):
+            pass
+
+    req = build_generate_music_request(
+        parser,
+        GenerateMusicRequest,
+        default_dit_instruction=DEFAULT_DIT_INSTRUCTION,
+        lm_default_temperature=LM_DEFAULT_TEMPERATURE,
+        lm_default_cfg_scale=LM_DEFAULT_CFG_SCALE,
+        lm_default_top_p=LM_DEFAULT_TOP_P,
+        **overrides,
+    )
+
+    # Clamp to the worker's safety envelope (all env-tunable).
+    if req.audio_duration is not None and float(req.audio_duration) > 0:
+        req.audio_duration = max(10.0, min(float(req.audio_duration), MAX_DURATION))
+    req.inference_steps = max(1, min(int(req.inference_steps), MAX_STEPS))
+    if req.batch_size is not None:
+        req.batch_size = max(1, min(int(req.batch_size), MAX_BATCH_SIZE))
+
+    _warn_cold_start_only_overrides(req)
+    return req
 
 
 # ---------------------------------------------------------------------------
@@ -432,8 +531,10 @@ def _parse_job_input(job_input: Dict[str, Any]) -> Dict[str, Any]:
 # safe fallbacks if the container's encoder can't honor the request.
 _AUDIO_FORMAT_MAP = {
     "wav": ("WAV", "PCM_16"),
+    "wav32": ("WAV", "FLOAT"),
     "flac": ("FLAC", None),
     "mp3": ("MP3", None),
+    "opus": ("OGG", "OPUS"),
 }
 
 
@@ -574,8 +675,75 @@ def _build_generation_metadata(result, audio_dict: Dict[str, Any], params_in: Di
 # ---------------------------------------------------------------------------
 # RunPod handler
 # ---------------------------------------------------------------------------
+def _build_generation_setup(req: Any):
+    """Resolve a request into ``(GenerationParams, GenerationConfig)``.
+
+    Mirrors the FastAPI ``run_blocking_generate`` flow using the shared helpers:
+    an LLM input pre-pass (sample_mode/use_format/CoT metadata) followed by the
+    canonical ``build_generation_setup`` mapping — so serverless and HTTP produce
+    identical params for the same request. The LM is already loaded at cold-start,
+    so the readiness callback is a no-op and a lightweight app-state shim carries
+    the LM-availability flag the helper expects.
+    """
+    from types import SimpleNamespace
+
+    from acestep.api.job_generation_setup import build_generation_setup
+    from acestep.api.llm_generation_inputs import prepare_llm_generation_inputs
+    from acestep.api.server_utils import (
+        is_instrumental,
+        parse_description_hints,
+        parse_timesteps,
+    )
+    from acestep.constants import DEFAULT_DIT_INSTRUCTION, TASK_INSTRUCTIONS
+    from acestep.inference import create_sample, format_sample
+
+    # The helper reads _llm_init_error to decide LM availability: when the LM
+    # did not load, a non-None error makes it auto-disable CoT (use_cot_*) and
+    # hard-fail requests that genuinely need the LM (thinking/sample_mode/format)
+    # — exactly the FastAPI server's contract. None means "LM ready".
+    app_state = SimpleNamespace(
+        _llm_initialized=_lm_available,
+        _llm_init_error=None if _lm_available else "5Hz LM not loaded on this worker",
+    )
+
+    prepared = prepare_llm_generation_inputs(
+        app_state=app_state,
+        llm_handler=_llm_handler,
+        req=req,
+        selected_handler_device=getattr(_dit_handler, "device", "cuda"),
+        parse_description_hints=parse_description_hints,
+        create_sample_fn=create_sample,
+        format_sample_fn=format_sample,
+        ensure_llm_ready_fn=lambda: None,  # LM is loaded once at cold-start.
+        log_fn=lambda message: logger.info("{}", message),
+    )
+
+    setup = build_generation_setup(
+        req=req,
+        caption=prepared.caption,
+        global_caption=prepared.global_caption,
+        lyrics=prepared.lyrics,
+        bpm=prepared.bpm,
+        key_scale=prepared.key_scale,
+        time_signature=prepared.time_signature,
+        audio_duration=prepared.audio_duration,
+        thinking=prepared.thinking,
+        sample_mode=prepared.sample_mode,
+        format_has_duration=prepared.format_has_duration,
+        use_cot_caption=prepared.use_cot_caption,
+        use_cot_language=prepared.use_cot_language,
+        lm_top_k=prepared.lm_top_k,
+        lm_top_p=prepared.lm_top_p,
+        parse_timesteps=parse_timesteps,
+        is_instrumental=is_instrumental,
+        default_dit_instruction=DEFAULT_DIT_INSTRUCTION,
+        task_instructions=TASK_INSTRUCTIONS,
+    )
+    return setup.params, setup.config, prepared
+
+
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
-    """RunPod serverless entrypoint: one job -> one generated track (base64 WAV)."""
+    """RunPod serverless entrypoint: one job -> one or more generated tracks."""
     job_id = job.get("id", "unknown")
 
     # Guard: if cold-start failed, surface a clear error instead of crashing.
@@ -583,44 +751,31 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": f"models not initialized: {_load_error or 'unknown error'}"}
 
     try:
-        params_in = _parse_job_input(job.get("input") or {})
+        req = _build_request(job.get("input") or {})
     except ValueError as exc:
         logger.warning("[rp_handler] job {} bad input: {}", job_id, exc)
         return {"error": f"invalid input: {exc}"}
 
+    audio_format = _resolve_audio_format(req.audio_format)
     logger.info(
-        "[rp_handler] job {} | steps={} duration={} seed={} thinking={} fmt={}",
+        "[rp_handler] job {} | task={} steps={} duration={} batch={} thinking={} fmt={}",
         job_id,
-        params_in["steps"],
-        params_in["duration"],
-        params_in["seed"],
-        params_in["thinking"],
-        params_in["audio_format"],
+        req.task_type,
+        req.inference_steps,
+        req.audio_duration,
+        req.batch_size,
+        req.thinking,
+        audio_format,
     )
 
     try:
-        from acestep.inference import GenerationParams, GenerationConfig, generate_music
+        from acestep.inference import generate_music
 
-        gen_params = GenerationParams(
-            task_type="text2music",
-            caption=params_in["prompt"],
-            lyrics=params_in["lyrics"],
-            instrumental=params_in["instrumental"],
-            duration=params_in["duration"],
-            inference_steps=params_in["steps"],
-            guidance_scale=params_in["guidance_scale"],
-            seed=params_in["seed"],
-            thinking=params_in["thinking"],
-            bpm=params_in["bpm"],
-            keyscale=params_in["keyscale"],
-            vocal_language=params_in["vocal_language"],
-        )
-        gen_config = GenerationConfig(
-            batch_size=1,
-            audio_format="wav",
-            use_random_seed=(params_in["seed"] < 0),
-            seeds=None if params_in["seed"] < 0 else [params_in["seed"]],
-        )
+        params, config, prepared = _build_generation_setup(req)
+        # We encode the returned tensor ourselves (save_dir=None); pin the
+        # pipeline's own format to WAV so it never attempts a format the
+        # container's encoder may lack.
+        config.audio_format = "wav"
 
         t0 = time.time()
         # Serialize: a single GPU cannot run two diffusion jobs concurrently.
@@ -628,8 +783,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             result = generate_music(
                 _dit_handler,
                 _llm_handler,
-                params=gen_params,
-                config=gen_config,
+                params=params,
+                config=config,
                 save_dir=None,  # in-memory only; we encode the tensor ourselves
             )
         elapsed = time.time() - t0
@@ -639,23 +794,42 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             logger.error("[rp_handler] job {} failed: {}", job_id, msg)
             return {"error": f"generation failed: {msg}"}
 
-        audio_out = result.audios[0]
-        payload = _encode_audio_dict(audio_out, params_in["audio_format"])
-        seed_used = audio_out.get("params", {}).get("seed", params_in["seed"])
+        # Encode every track (batch_size may be > 1). The top-level fields mirror
+        # the first track so single-track clients keep working unchanged.
+        tracks = []
+        for audio_out in result.audios:
+            track = _encode_audio_dict(audio_out, audio_format)
+            track["seed"] = audio_out.get("params", {}).get("seed")
+            tracks.append(track)
+
+        # Metadata-echo fallback source: what the LM/DiT actually resolved.
+        params_in = {
+            "prompt": prepared.caption or req.prompt or "",
+            "lyrics": prepared.lyrics or req.lyrics or "",
+            "bpm": prepared.bpm,
+            "key_scale": prepared.key_scale or "",
+            "time_signature": prepared.time_signature or "",
+            "vocal_language": req.vocal_language or "unknown",
+            "audio_duration": prepared.audio_duration,
+        }
+
+        payload = dict(tracks[0])
         payload.update(
             {
-                "seed": seed_used,
                 "generation_time_seconds": round(elapsed, 2),
                 "status_message": result.status_message,
             }
         )
         # Echo back the prompt/lyrics/musical metadata (LM-generated in thinking
         # mode) so the client gets the full song context alongside the audio.
-        payload.update(_build_generation_metadata(result, audio_out, params_in))
+        payload.update(_build_generation_metadata(result, result.audios[0], params_in))
+        if len(tracks) > 1:
+            payload["audios"] = tracks
         logger.info(
-            "[rp_handler] job {} done in {:.1f}s ({}s audio)",
+            "[rp_handler] job {} done in {:.1f}s ({} track(s), {}s audio)",
             job_id,
             elapsed,
+            len(tracks),
             payload["duration_seconds"],
         )
         return payload
