@@ -26,13 +26,22 @@ Job input schema (``job["input"]``)
 Response
 --------
     {
-        "audio_base64": "<base64 WAV>",
+        "audio_base64": "<base64 audio>",
         "sample_rate": 48000,
-        "format": "wav",
+        "format": "mp3",
         "seed": 1234,
         "duration_seconds": 30.0,
         "generation_time_seconds": 12.3,
-        "status_message": "..."
+        "status_message": "...",
+        # Song context — LM-generated in thinking mode, else the resolved/user
+        # values that were actually used for generation.
+        "prompt": "A soft romantic pop song with gentle piano arpeggios...",
+        "lyrics": "[Verse 1]\n...\n[Chorus]\n...",
+        "bpm": 90,
+        "key_scale": "G Major",
+        "time_signature": "4",
+        "vocal_language": "en",
+        "audio_duration": 180
     }
 
 On failure the handler returns ``{"error": "..."}`` so the RunPod client gets a
@@ -103,6 +112,15 @@ DEVICE = os.environ.get("ACESTEP_DEVICE", "auto").strip()
 # Whether to initialize the 5Hz LM at all. Disable for pure-DiT (faster, less
 # VRAM, but no Chain-of-Thought / thinking mode).
 INIT_LLM = os.environ.get("ACESTEP_INIT_LLM", "true").strip().lower() in ("1", "true", "yes", "auto")
+
+# Strict LM mode. When the LM is requested (INIT_LLM=true) but cannot be made
+# available — not baked into the image AND not downloadable — the worker would
+# otherwise silently fall back to pure-DiT, returning empty thinking-mode
+# metadata (lyrics/bpm/key) with no obvious cause. With REQUIRE_LLM=true the
+# cold-start instead FAILS LOUDLY so a model/endpoint misconfiguration surfaces
+# immediately (worker marked unhealthy) instead of shipping degraded output.
+# Default true: if you explicitly asked for the LM, a missing LM is an error.
+REQUIRE_LLM = os.environ.get("ACESTEP_REQUIRE_LLM", "true").strip().lower() in ("1", "true", "yes")
 
 # On a 24 GB RTX 4090, turbo DiT + 1.7B LM fit without offload. Override to
 # "true" on smaller cards to trade speed for headroom.
@@ -177,6 +195,47 @@ def _log_checkpoints_presence(checkpoint_dir: str) -> bool:
     return has_weights
 
 
+def _ensure_lm_present(checkpoint_dir: str) -> tuple[bool, str]:
+    """Make sure the requested 5Hz LM exists locally, downloading it if missing.
+
+    The LM loader (``llm_inference.initialize``) does NOT download — it only
+    checks ``<checkpoint_dir>/<LM_MODEL_PATH>`` and fails if absent. The image is
+    expected to bake the configured LM (see Dockerfile.runpod ``LM_MODEL``), so
+    in steady state this is a no-op. But if the endpoint's
+    ``ACESTEP_LM_MODEL_PATH`` was changed WITHOUT a matching image rebuild, the LM
+    would be missing and thinking mode would silently die. To stay
+    fail-operational — mirroring the DiT loader's auto-download — we download the
+    LM once here when it is missing. Returns ``(present, detail)``.
+    """
+    lm_path = os.path.join(checkpoint_dir, LM_MODEL_PATH)
+    if os.path.isdir(lm_path) and os.listdir(lm_path):
+        return True, f"present at {lm_path}"
+
+    logger.warning(
+        "[rp_handler] LM '{}' not found at {} — it was not baked into the image. "
+        "Attempting one-time download (rebuild the image with LM_MODEL={} to avoid this).",
+        LM_MODEL_PATH, lm_path, LM_MODEL_PATH,
+    )
+    try:
+        from acestep.model_downloader import SUBMODEL_REGISTRY, download_submodel
+
+        if LM_MODEL_PATH not in SUBMODEL_REGISTRY:
+            return False, (
+                f"LM '{LM_MODEL_PATH}' is absent locally and not in SUBMODEL_REGISTRY, "
+                f"so it cannot be auto-downloaded — bake it into the image."
+            )
+        prefer_source = None if DOWNLOAD_SOURCE in ("", "auto") else DOWNLOAD_SOURCE
+        ok, msg = download_submodel(
+            LM_MODEL_PATH,
+            checkpoints_dir=checkpoint_dir,
+            token=os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"),
+            prefer_source=prefer_source,
+        )
+        return ok, msg
+    except Exception as exc:  # pragma: no cover - network/runtime dependent
+        return False, f"LM download raised: {exc}"
+
+
 def _load_models() -> None:
     """Cold-start: load the DiT pipeline and (optionally) the 5Hz LM exactly once."""
     global _dit_handler, _llm_handler, _lm_available, _models_ready, _load_error
@@ -230,32 +289,52 @@ def _load_models() -> None:
         _dit_handler = dit_handler
         logger.info("[rp_handler] DiT ready ({:.1f}s) — {}", time.time() - t_start, status_msg)
 
-        # ---- 5Hz language model (optional) ----
+        # ---- 5Hz language model (thinking/CoT) ----
+        # Fail-operational: ensure the LM is present (download once if a config
+        # change wasn't matched by an image rebuild), then init. If it still
+        # can't load, either hard-fail (REQUIRE_LLM=true) so the misconfig is
+        # obvious, or degrade to pure-DiT with a loud, actionable warning.
         if INIT_LLM:
+            lm_failure: Optional[str] = None
             try:
-                logger.info("[rp_handler] Initializing 5Hz LM ({})...", LM_MODEL_PATH)
-                llm_handler = LLMHandler()
-                lm_status, lm_success = llm_handler.initialize(
-                    checkpoint_dir=checkpoint_dir,
-                    lm_model_path=LM_MODEL_PATH,
-                    backend=LM_BACKEND,
-                    device=DEVICE,
-                    offload_to_cpu=OFFLOAD_TO_CPU,
-                    dtype=None,
-                )
-                if lm_success:
-                    _llm_handler = llm_handler
-                    _lm_available = True
-                    logger.info("[rp_handler] 5Hz LM ready — {}", lm_status)
+                present, detail = _ensure_lm_present(checkpoint_dir)
+                if not present:
+                    lm_failure = f"LM unavailable: {detail}"
                 else:
-                    logger.warning(
-                        "[rp_handler] LM init failed ({}); continuing in pure-DiT mode.",
-                        lm_status,
+                    logger.info("[rp_handler] LM '{}' {} — initializing...", LM_MODEL_PATH, detail)
+                    llm_handler = LLMHandler()
+                    lm_status, lm_success = llm_handler.initialize(
+                        checkpoint_dir=checkpoint_dir,
+                        lm_model_path=LM_MODEL_PATH,
+                        backend=LM_BACKEND,
+                        device=DEVICE,
+                        offload_to_cpu=OFFLOAD_TO_CPU,
+                        dtype=None,
                     )
+                    if lm_success:
+                        _llm_handler = llm_handler
+                        _lm_available = True
+                        logger.info("[rp_handler] 5Hz LM ready — {}", lm_status)
+                    else:
+                        lm_failure = f"LM init failed: {lm_status}"
             except Exception as lm_exc:
+                lm_failure = f"LM init raised: {lm_exc}"
+
+            if lm_failure and not _lm_available:
+                if REQUIRE_LLM:
+                    # Thinking mode is required but unavailable — refuse to start
+                    # in degraded mode so the bad config surfaces immediately.
+                    raise RuntimeError(
+                        f"{lm_failure}. ACESTEP_INIT_LLM=true and ACESTEP_REQUIRE_LLM=true, "
+                        f"so refusing to serve in degraded pure-DiT mode. Bake "
+                        f"'{LM_MODEL_PATH}' into the image (Dockerfile.runpod LM_MODEL) or "
+                        f"set ACESTEP_REQUIRE_LLM=false to allow a pure-DiT fallback."
+                    )
                 logger.warning(
-                    "[rp_handler] LM init raised ({}); continuing in pure-DiT mode.",
-                    lm_exc,
+                    "[rp_handler] {} — continuing in pure-DiT mode (thinking disabled, "
+                    "lyrics/bpm/key will not be generated). Set ACESTEP_REQUIRE_LLM=true "
+                    "to fail fast on this instead.",
+                    lm_failure,
                 )
         else:
             logger.info("[rp_handler] LM disabled (ACESTEP_INIT_LLM=false) — pure-DiT mode.")
@@ -421,7 +500,71 @@ def _encode_audio_dict(audio_dict: Dict[str, Any], audio_format: str = "mp3") ->
         "sample_rate": sample_rate,
         "format": actual_format,
         "duration_seconds": round(num_samples / float(sample_rate), 2),
-        "key": audio_dict.get("key", ""),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Generation metadata extraction
+# ---------------------------------------------------------------------------
+# Values the caller cares about (lyrics, bpm, key, etc.) can originate from
+# three places, in decreasing priority:
+#   1. The 5Hz LM (thinking mode) — it *generates* lyrics/bpm/key/time-sig from
+#      the prompt. Surfaced on result.extra_outputs["lm_metadata"].
+#   2. The per-audio params dict — the values actually fed to the DiT pipeline
+#      (already merged with any LM/CoT output).
+#   3. The user's raw request — what they explicitly passed in.
+# "Empty" sentinels we skip so a real value further down the chain wins.
+_EMPTY_META_VALUES = (None, "", "N/A", "n/a", "unknown", -1, "-1")
+
+
+def _first_meta_value(sources: tuple, *keys: str) -> Any:
+    """Return the first meaningful value found across sources for any of keys."""
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, str):
+                value = value.strip()
+            if value not in _EMPTY_META_VALUES:
+                return value
+    return None
+
+
+def _as_int(value: Any) -> Optional[int]:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_number(value: Any):
+    """Coerce to int when whole (e.g. 180), else a 2-dp float; None on failure."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(number) if number.is_integer() else round(number, 2)
+
+
+def _build_generation_metadata(result, audio_dict: Dict[str, Any], params_in: Dict[str, Any]) -> Dict[str, Any]:
+    """Collect the prompt/lyrics/musical metadata to echo back in the response.
+
+    Prefers LM-generated values (thinking mode) over the resolved DiT params
+    over the raw request, so the client sees what was *actually* used/created.
+    """
+    lm_meta = (getattr(result, "extra_outputs", None) or {}).get("lm_metadata") or {}
+    audio_params = audio_dict.get("params") or {}
+    sources = (lm_meta, audio_params, params_in)
+
+    return {
+        "prompt": _first_meta_value(sources, "caption", "prompt") or params_in.get("prompt", ""),
+        "lyrics": _first_meta_value(sources, "lyrics") or params_in.get("lyrics", ""),
+        "bpm": _as_int(_first_meta_value(sources, "bpm")),
+        "key_scale": _first_meta_value(sources, "keyscale", "key_scale") or "",
+        "time_signature": str(_first_meta_value(sources, "timesignature", "time_signature") or ""),
+        "vocal_language": _first_meta_value(sources, "vocal_language") or "unknown",
+        "audio_duration": _as_number(_first_meta_value(sources, "duration", "audio_duration")),
     }
 
 
@@ -493,8 +636,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             logger.error("[rp_handler] job {} failed: {}", job_id, msg)
             return {"error": f"generation failed: {msg}"}
 
-        payload = _encode_audio_dict(result.audios[0], params_in["audio_format"])
-        seed_used = result.audios[0].get("params", {}).get("seed", params_in["seed"])
+        audio_out = result.audios[0]
+        payload = _encode_audio_dict(audio_out, params_in["audio_format"])
+        seed_used = audio_out.get("params", {}).get("seed", params_in["seed"])
         payload.update(
             {
                 "seed": seed_used,
@@ -502,6 +646,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "status_message": result.status_message,
             }
         )
+        # Echo back the prompt/lyrics/musical metadata (LM-generated in thinking
+        # mode) so the client gets the full song context alongside the audio.
+        payload.update(_build_generation_metadata(result, audio_out, params_in))
         logger.info(
             "[rp_handler] job {} done in {:.1f}s ({}s audio)",
             job_id,
