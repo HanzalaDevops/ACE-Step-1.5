@@ -60,3 +60,6 @@ xxhash
 
 # RunPod Serverless SDK (queue-based worker runtime + rp_handler.py)
 runpod>=1.7.0
+
+# Cloudinary SDK (rp_handler.py uploads generated audio and returns its URL)
+cloudinary>=1.40.0

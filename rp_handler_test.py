@@ -169,30 +169,73 @@ class BuildRequestTests(unittest.TestCase):
         self.assertEqual("a soft ballad", req.sample_query)
 
 
-class ResolveAudioFormatTests(unittest.TestCase):
-    """Behavior tests for ``_resolve_audio_format`` encoder selection."""
+class SplitAudioFormatTests(unittest.TestCase):
+    """``_split_audio_format`` -> (local_encode_format, cloudinary_target)."""
 
-    def test_known_formats_pass_through(self):
-        """Encoder-supported formats are returned unchanged."""
+    def test_local_formats_encode_directly_no_transcode(self):
+        """libsndfile-supported formats encode locally; no Cloudinary transcode."""
 
         for fmt in ("wav", "wav32", "flac", "mp3", "opus"):
-            self.assertEqual(fmt, h._resolve_audio_format(fmt))
+            self.assertEqual((fmt, None), h._split_audio_format(fmt))
 
-    def test_aac_downgrades_to_mp3(self):
-        """AAC has no in-worker encoder and is served as MP3."""
+    def test_aac_encodes_wav_and_transcodes_via_cloudinary(self):
+        """AAC has no in-worker encoder: encode WAV, let Cloudinary make AAC."""
 
-        self.assertEqual("mp3", h._resolve_audio_format("aac"))
+        self.assertEqual(("wav", "aac"), h._split_audio_format("aac"))
 
     def test_unknown_defaults_to_mp3(self):
-        """An unrecognised/empty format defaults to MP3."""
+        """An unrecognised/empty format defaults to mp3 (no transcode)."""
 
-        self.assertEqual("mp3", h._resolve_audio_format("totally-bogus"))
-        self.assertEqual("mp3", h._resolve_audio_format(None))
+        self.assertEqual(("mp3", None), h._split_audio_format("totally-bogus"))
+        self.assertEqual(("mp3", None), h._split_audio_format(None))
 
     def test_case_insensitive(self):
         """Format matching is case-insensitive."""
 
-        self.assertEqual("flac", h._resolve_audio_format("FLAC"))
+        self.assertEqual(("flac", None), h._split_audio_format("FLAC"))
+        self.assertEqual(("wav", "aac"), h._split_audio_format("AAC"))
+
+
+class BuildGenerationMetadataTests(unittest.TestCase):
+    """``_build_generation_metadata`` echo of the LM-generated song blueprint."""
+
+    def _result(self, lm_metadata):
+        """A minimal result stand-in exposing extra_outputs['lm_metadata']."""
+
+        return types.SimpleNamespace(extra_outputs={"lm_metadata": lm_metadata})
+
+    def test_lm_language_key_maps_to_vocal_language(self):
+        """LM writes detected language under 'language'; the echo must surface it.
+
+        Regression: the LM CoT parser stores the key as 'language' (not
+        'vocal_language'), so reading only 'vocal_language' silently dropped it
+        and the response always returned 'unknown'.
+        """
+
+        result = self._result({"language": "bn", "caption": "a soft bengali song"})
+        meta = h._build_generation_metadata(result, {"params": {}}, {})
+        self.assertEqual("bn", meta["vocal_language"])
+
+    def test_canonical_vocal_language_key_still_works(self):
+        """A source using the 'vocal_language' key is still honoured."""
+
+        meta = h._build_generation_metadata(
+            self._result({}), {"params": {"vocal_language": "ja"}}, {}
+        )
+        self.assertEqual("ja", meta["vocal_language"])
+
+    def test_lm_language_wins_over_request_default(self):
+        """LM 'language' (priority source) beats the raw-request fallback."""
+
+        result = self._result({"language": "fr"})
+        meta = h._build_generation_metadata(result, {"params": {}}, {"vocal_language": "en"})
+        self.assertEqual("fr", meta["vocal_language"])
+
+    def test_pure_dit_mode_falls_back_to_unknown(self):
+        """No LM metadata and no user language -> 'unknown' (pure-DiT mode)."""
+
+        meta = h._build_generation_metadata(self._result(None), {"params": {}}, {})
+        self.assertEqual("unknown", meta["vocal_language"])
 
 
 class ColdStartOverrideWarningTests(unittest.TestCase):

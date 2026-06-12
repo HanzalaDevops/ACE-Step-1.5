@@ -367,8 +367,12 @@ def _update_metadata_from_lm(
             except (ValueError, TypeError):
                 pass
 
-    if not vocal_language and metadata.get('vocal_language'):
-        vocal_language = metadata.get('vocal_language')
+    # The LM CoT parser writes the detected language under 'language' (see
+    # llm_inference.py); accept that canonical key as well as 'vocal_language'
+    # so the LM-detected language is not silently dropped.
+    lm_language = metadata.get('language', metadata.get('vocal_language'))
+    if not vocal_language and lm_language:
+        vocal_language = lm_language
     if not caption and metadata.get('caption'):
         caption = metadata.get('caption')
     if not lyrics and metadata.get('lyrics'):
@@ -804,7 +808,10 @@ def generate_music(
             if params.use_cot_caption:
                 dit_input_caption = lm_generated_metadata.get("caption", dit_input_caption)
             if params.use_cot_language:
-                dit_input_vocal_language = lm_generated_metadata.get("vocal_language", dit_input_vocal_language)
+                dit_input_vocal_language = lm_generated_metadata.get(
+                    "language",
+                    lm_generated_metadata.get("vocal_language", dit_input_vocal_language),
+                )
 
         # Repaint/cover/extract: no LM run, so conditioning must come from params (caption + lyrics from GUI).
         if params.task_type in ("repaint", "cover", "cover-nofsq", "extract"):

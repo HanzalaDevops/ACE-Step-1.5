@@ -10,7 +10,8 @@ Lifecycle
    Weights are pulled from HuggingFace on first run via the upstream
    ``model_downloader`` (which honours ``HF_TOKEN`` for gated repos).
 2. Per-request: ``handler(job)`` reads ``job["input"]``, runs one generation,
-   and returns base64-encoded WAV audio. Models are NEVER reloaded per request.
+   uploads the audio to Cloudinary and returns its URL. Models are NEVER
+   reloaded per request.
 
 Job input schema (``job["input"]``)
 ------------------------------------
@@ -25,7 +26,11 @@ complete list and ``release_task_param_parser.PARAM_ALIASES`` for every alias):
     lyrics   (str)            lyrics; "[Instrumental]" for no vocals.
     instrumental (bool)       force instrumental output.
     audio_duration (float)    target seconds (10-600); aliases duration/target_duration. -1 = auto.
-    audio_format (str)        mp3 (default) | wav | wav32 | flac | opus. (aac -> mp3 in-worker.)
+    audio_format (str)        mp3 (default) | wav | wav32 | flac | opus | aac.
+                              (aac is encoded as WAV in-worker then transcoded to
+                              AAC by Cloudinary, since libsndfile has no AAC encoder.)
+    cloudinary_folder (str)   Cloudinary folder to upload the audio into (worker
+                              field, not a model field). Empty -> account root.
     batch_size (int)          1..8 tracks; extra tracks returned under "audios".
     seed / use_random_seed    reproducibility controls.
     thinking (bool)           5Hz-LM CoT (auto-disabled if the LM did not load).
@@ -43,7 +48,8 @@ value that differs from the loaded model is ignored with a warning.
 Response
 --------
     {
-        "audio_base64": "<base64 audio>",
+        "audio_url": "https://res.cloudinary.com/<cloud>/video/upload/.../song.mp3",
+        "cloudinary_public_id": "songs/user123/abcd1234",
         "sample_rate": 48000,
         "format": "mp3",
         "seed": 1234,
@@ -60,17 +66,18 @@ Response
         "vocal_language": "en",
         "audio_duration": 180,
         # Only present when batch_size > 1: every generated track (the top-level
-        # audio_base64/seed mirror tracks[0] for single-track back-compat).
-        "audios": [{"audio_base64": "...", "seed": 1234, ...}, ...]
+        # audio_url/seed mirror tracks[0] for single-track back-compat).
+        "audios": [{"audio_url": "...", "seed": 1234, ...}, ...]
     }
 
-On failure the handler returns ``{"error": "..."}`` so the RunPod client gets a
+The audio is uploaded to Cloudinary (not returned inline) so the response stays
+small and long songs never trip RunPod's /job-done response-size limit. On
+failure the handler returns ``{"error": "..."}`` so the RunPod client gets a
 structured error instead of an opaque worker crash.
 """
 
 from __future__ import annotations
 
-import base64
 import io
 import os
 import sys
@@ -107,6 +114,8 @@ os.environ.setdefault("ACESTEP_CHECKPOINTS_DIR", "/app/checkpoints")
 from loguru import logger  # noqa: E402  (after env setup, before heavy imports)
 
 import runpod  # noqa: E402
+
+import cloudinary_uploader  # noqa: E402  (local module; lazy-imports the SDK)
 
 # ---------------------------------------------------------------------------
 # Configuration (all overridable via environment variables)
@@ -385,23 +394,31 @@ def _load_models() -> None:
 # ---------------------------------------------------------------------------
 # Input parsing & validation
 # ---------------------------------------------------------------------------
-def _resolve_audio_format(req_format: Optional[str]) -> str:
-    """Pick the in-worker encoder format for a requested ``audio_format``.
+# Formats libsndfile can encode in-worker. "aac" is deliberately absent —
+# libsndfile has no AAC encoder, so it is produced via Cloudinary transcoding.
+_LOCAL_ENCODABLE_FORMATS = ("wav", "wav32", "flac", "mp3", "opus")
+_ALL_REQUEST_FORMATS = _LOCAL_ENCODABLE_FORMATS + ("aac",)
 
-    libsndfile (used for in-memory encoding here) has no AAC encoder, so an
-    ``aac`` request is honoured as MP3 — the closest lossy format the worker can
-    actually produce. Anything unrecognised also degrades to MP3, which keeps the
-    inline base64 small enough for RunPod's /job-done response-size limit.
+
+def _split_audio_format(req_format: Optional[str]) -> tuple[str, Optional[str]]:
+    """Map a requested ``audio_format`` to ``(local_encode_format, cloud_target)``.
+
+    The worker encodes audio in-memory with libsndfile, which supports
+    wav/wav32/flac/mp3/opus — those are encoded directly and uploaded as-is
+    (``cloud_target`` is None, so Cloudinary keeps the format). libsndfile has NO
+    AAC encoder, so ``aac`` is encoded locally as lossless WAV and Cloudinary is
+    asked to transcode the stored asset to AAC (``cloud_target='aac'``). An
+    unknown/empty format degrades to mp3.
     """
     fmt = str(req_format or "mp3").strip().lower()
-    if fmt == "aac":
-        logger.warning("[rp_handler] 'aac' has no in-worker encoder; serving 'mp3' instead.")
-        return "mp3"
-    if fmt not in _AUDIO_FORMAT_MAP:
+    if fmt not in _ALL_REQUEST_FORMATS:
         if fmt:
             logger.warning("[rp_handler] unknown audio_format '{}'; serving 'mp3'.", fmt)
-        return "mp3"
-    return fmt
+        fmt = "mp3"
+    if fmt == "aac":
+        # Encode lossless WAV locally; Cloudinary converts the stored asset to AAC.
+        return "wav", "aac"
+    return fmt, None
 
 
 def _warn_cold_start_only_overrides(req: Any) -> None:
@@ -575,36 +592,30 @@ def _tensor_to_audio_bytes(audio_tensor, sample_rate: int, audio_format: str):
     raise RuntimeError("no available audio encoder (wav/flac/mp3 all failed)")
 
 
-def _encode_audio_dict(audio_dict: Dict[str, Any], audio_format: str = "mp3") -> Dict[str, Any]:
-    """Turn one pipeline audio dict into a base64 audio payload.
+def _audio_dict_to_bytes(audio_dict: Dict[str, Any], encode_format: str):
+    """Encode one pipeline audio dict to bytes for upload.
 
-    Defaults to a compressed format so the inline base64 stays under RunPod's
-    /job-done response-size limit; raw WAV of a long clip exceeds it and the
-    platform rejects the result with HTTP 400.
+    Returns ``(audio_bytes, actual_format, sample_rate, duration_seconds)``.
+    The bytes are uploaded to Cloudinary by the caller — we no longer base64 the
+    audio inline, which is what kept long clips under RunPod's response-size cap.
     """
     tensor = audio_dict.get("tensor")
     sample_rate = int(audio_dict.get("sample_rate") or 48000)
     if tensor is None:
         raise RuntimeError("generation produced no audio tensor")
 
-    audio_bytes, actual_format = _tensor_to_audio_bytes(tensor, sample_rate, audio_format)
-    audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+    audio_bytes, actual_format = _tensor_to_audio_bytes(tensor, sample_rate, encode_format)
     num_samples = tensor.shape[-1]
+    duration_seconds = round(num_samples / float(sample_rate), 2)
 
-    # Log payload size so any future oversize 400 is trivial to diagnose.
     logger.info(
-        "[encode] format={} bytes={} base64_len={} (~{:.2f} MB)",
+        "[encode] format={} bytes={} (~{:.2f} MB) duration={}s",
         actual_format,
         len(audio_bytes),
-        len(audio_b64),
-        len(audio_b64) / 1_048_576,
+        len(audio_bytes) / 1_048_576,
+        duration_seconds,
     )
-    return {
-        "audio_base64": audio_b64,
-        "sample_rate": sample_rate,
-        "format": actual_format,
-        "duration_seconds": round(num_samples / float(sample_rate), 2),
-    }
+    return audio_bytes, actual_format, sample_rate, duration_seconds
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +678,7 @@ def _build_generation_metadata(result, audio_dict: Dict[str, Any], params_in: Di
         "bpm": _as_int(_first_meta_value(sources, "bpm")),
         "key_scale": _first_meta_value(sources, "keyscale", "key_scale") or "",
         "time_signature": str(_first_meta_value(sources, "timesignature", "time_signature") or ""),
-        "vocal_language": _first_meta_value(sources, "vocal_language") or "unknown",
+        "vocal_language": _first_meta_value(sources, "vocal_language", "language") or "unknown",
         "audio_duration": _as_number(_first_meta_value(sources, "duration", "audio_duration")),
     }
 
@@ -750,22 +761,41 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     if not _models_ready:
         return {"error": f"models not initialized: {_load_error or 'unknown error'}"}
 
+    # Fail loud (per contract): the worker uploads to Cloudinary, so missing
+    # credentials are a misconfiguration to surface immediately, not silently.
+    if not cloudinary_uploader.is_configured():
+        logger.error("[rp_handler] job {} aborted: Cloudinary not configured", job_id)
+        return {
+            "error": (
+                "Cloudinary not configured: set CLOUDINARY_URL (or "
+                "CLOUDINARY_CLOUD_NAME/API_KEY/API_SECRET) on the endpoint."
+            )
+        }
+
+    job_input = job.get("input") or {}
     try:
-        req = _build_request(job.get("input") or {})
+        req = _build_request(job_input)
     except ValueError as exc:
         logger.warning("[rp_handler] job {} bad input: {}", job_id, exc)
         return {"error": f"invalid input: {exc}"}
 
-    audio_format = _resolve_audio_format(req.audio_format)
+    # Worker-level field (not part of the model contract): where to upload.
+    cloudinary_folder = str(job_input.get("cloudinary_folder") or "").strip()
+    # local_format = what libsndfile encodes; cloud_target = optional Cloudinary
+    # transcode (set only for aac, which has no in-worker encoder).
+    local_format, cloud_target = _split_audio_format(req.audio_format)
     logger.info(
-        "[rp_handler] job {} | task={} steps={} duration={} batch={} thinking={} fmt={}",
+        "[rp_handler] job {} | task={} steps={} duration={} batch={} thinking={} "
+        "fmt={} (encode={}) folder={}",
         job_id,
         req.task_type,
         req.inference_steps,
         req.audio_duration,
         req.batch_size,
         req.thinking,
-        audio_format,
+        cloud_target or local_format,
+        local_format,
+        cloudinary_folder or "<root>",
     )
 
     try:
@@ -794,13 +824,30 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             logger.error("[rp_handler] job {} failed: {}", job_id, msg)
             return {"error": f"generation failed: {msg}"}
 
-        # Encode every track (batch_size may be > 1). The top-level fields mirror
-        # the first track so single-track clients keep working unchanged.
+        # Encode + upload every track (batch_size may be > 1). The top-level
+        # fields mirror the first track so single-track clients keep working.
         tracks = []
-        for audio_out in result.audios:
-            track = _encode_audio_dict(audio_out, audio_format)
-            track["seed"] = audio_out.get("params", {}).get("seed")
-            tracks.append(track)
+        for idx, audio_out in enumerate(result.audios):
+            audio_bytes, actual_format, sample_rate, duration_seconds = _audio_dict_to_bytes(
+                audio_out, local_format
+            )
+            uploaded = cloudinary_uploader.upload_audio(
+                audio_bytes,
+                cloudinary_folder,
+                target_format=cloud_target,
+            )
+            tracks.append(
+                {
+                    "audio_url": uploaded["url"],
+                    "cloudinary_public_id": uploaded["public_id"],
+                    # Cloudinary's reported format wins (reflects any transcode);
+                    # fall back to the requested/local format if it's absent.
+                    "format": uploaded["format"] or cloud_target or actual_format,
+                    "sample_rate": sample_rate,
+                    "duration_seconds": duration_seconds,
+                    "seed": audio_out.get("params", {}).get("seed"),
+                }
+            )
 
         # Metadata-echo fallback source: what the LM/DiT actually resolved.
         params_in = {
@@ -833,6 +880,12 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             payload["duration_seconds"],
         )
         return payload
+
+    except cloudinary_uploader.CloudinaryUploadError as exc:
+        # The audio generated fine but could not be stored — surface a clear,
+        # actionable error rather than an opaque "internal error".
+        logger.error("[rp_handler] job {} upload failed: {}", job_id, exc)
+        return {"error": f"upload failed: {exc}"}
 
     except Exception as exc:
         err = f"{exc}"
