@@ -31,6 +31,10 @@ complete list and ``release_task_param_parser.PARAM_ALIASES`` for every alias):
                               AAC by Cloudinary, since libsndfile has no AAC encoder.)
     cloudinary_folder (str)   Cloudinary folder to upload the audio into (worker
                               field, not a model field). Empty -> account root.
+    cloudinary_cloud_name / cloudinary_api_key / cloudinary_api_secret (str)
+                              Per-request Cloudinary credentials (the backend
+                              injects them). Used for THIS upload only; fall back
+                              to CLOUDINARY_* env vars when all three are absent.
     batch_size (int)          1..8 tracks; extra tracks returned under "audios".
     seed / use_random_seed    reproducibility controls.
     thinking (bool)           5Hz-LM CoT (auto-disabled if the LM did not load).
@@ -761,17 +765,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     if not _models_ready:
         return {"error": f"models not initialized: {_load_error or 'unknown error'}"}
 
-    # Fail loud (per contract): the worker uploads to Cloudinary, so missing
-    # credentials are a misconfiguration to surface immediately, not silently.
-    if not cloudinary_uploader.is_configured():
-        logger.error("[rp_handler] job {} aborted: Cloudinary not configured", job_id)
-        return {
-            "error": (
-                "Cloudinary not configured: set CLOUDINARY_URL (or "
-                "CLOUDINARY_CLOUD_NAME/API_KEY/API_SECRET) on the endpoint."
-            )
-        }
-
     job_input = job.get("input") or {}
     try:
         req = _build_request(job_input)
@@ -779,8 +772,26 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         logger.warning("[rp_handler] job {} bad input: {}", job_id, exc)
         return {"error": f"invalid input: {exc}"}
 
-    # Worker-level field (not part of the model contract): where to upload.
+    # Cloudinary settings travel in the request body (the backend injects them),
+    # so they are read here — NOT from the worker env. Credentials are passed
+    # straight to the uploader; env vars are only a fallback.
     cloudinary_folder = str(job_input.get("cloudinary_folder") or "").strip()
+    cloud_name = str(job_input.get("cloudinary_cloud_name") or "").strip()
+    api_key = str(job_input.get("cloudinary_api_key") or "").strip()
+    api_secret = str(job_input.get("cloudinary_api_secret") or "").strip()
+
+    # Fail loud: with no request credentials AND no env fallback, the audio
+    # could never be stored — reject before spending GPU time on generation.
+    has_request_creds = bool(cloud_name and api_key and api_secret)
+    if not has_request_creds and not cloudinary_uploader.is_configured():
+        logger.error("[rp_handler] job {} aborted: Cloudinary credentials missing", job_id)
+        return {
+            "error": (
+                "Cloudinary credentials missing: pass cloudinary_cloud_name, "
+                "cloudinary_api_key and cloudinary_api_secret in the request input."
+            )
+        }
+
     # local_format = what libsndfile encodes; cloud_target = optional Cloudinary
     # transcode (set only for aac, which has no in-worker encoder).
     local_format, cloud_target = _split_audio_format(req.audio_format)
@@ -835,6 +846,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 audio_bytes,
                 cloudinary_folder,
                 target_format=cloud_target,
+                cloud_name=cloud_name or None,
+                api_key=api_key or None,
+                api_secret=api_secret or None,
             )
             tracks.append(
                 {
