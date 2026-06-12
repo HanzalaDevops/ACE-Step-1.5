@@ -122,6 +122,34 @@ class UploadAudioTests(unittest.TestCase):
         _, kwargs = upload_mock.call_args
         self.assertNotIn("folder", kwargs)
 
+    def test_request_credentials_are_passed_per_call(self):
+        """Per-request creds (no env) are forwarded as upload options."""
+
+        upload_mock = _install_fake_cloudinary(
+            upload_return={"secure_url": "https://x/y.mp3", "public_id": "y", "format": "mp3"}
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):  # no env config at all
+            cu.upload_audio(
+                b"bytes",
+                "songs",
+                cloud_name="mycloud",
+                api_key="key123",
+                api_secret="secret456",
+            )
+
+        _, kwargs = upload_mock.call_args
+        self.assertEqual("mycloud", kwargs["cloud_name"])
+        self.assertEqual("key123", kwargs["api_key"])
+        self.assertEqual("secret456", kwargs["api_secret"])
+
+    def test_raises_when_partial_request_creds_and_no_env(self):
+        """Incomplete request creds with no env fallback is rejected."""
+
+        _install_fake_cloudinary(upload_return={"secure_url": "https://x/y.mp3"})
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(cu.CloudinaryUploadError):
+                cu.upload_audio(b"bytes", "songs", cloud_name="mycloud", api_key="key123")
+
     def test_api_error_is_wrapped(self):
         _install_fake_cloudinary(upload_side_effect=RuntimeError("boom"))
         with mock.patch.dict(os.environ, {"CLOUDINARY_URL": "cloudinary://k:s@c"}, clear=True):

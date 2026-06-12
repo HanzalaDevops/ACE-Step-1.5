@@ -10,11 +10,12 @@ Audio is stored under Cloudinary's ``video`` resource type — Cloudinary models
 audio as a subset of its video pipeline, which is also what enables on-upload
 transcoding (e.g. wav -> aac, a format libsndfile cannot encode in-worker).
 
-Configuration is read from the environment — set the three discrete
-``CLOUDINARY_CLOUD_NAME`` / ``CLOUDINARY_API_KEY`` / ``CLOUDINARY_API_SECRET``
-vars (or a single ``CLOUDINARY_URL``) as RunPod Secrets. The upload folder comes
-entirely from the request's ``cloudinary_folder``. No credential is ever
-hardcoded here.
+Credentials and the upload folder come from the request body (the backend
+injects ``cloudinary_cloud_name`` / ``cloudinary_api_key`` /
+``cloudinary_api_secret`` / ``cloudinary_folder`` per call). Request credentials
+are passed as upload options so they apply to that call only — nothing is
+stored on the worker. The ``CLOUDINARY_*`` env vars remain an optional fallback.
+No credential is ever hardcoded here.
 """
 from __future__ import annotations
 
@@ -72,8 +73,17 @@ def upload_audio(
     *,
     target_format: Optional[str] = None,
     public_id: Optional[str] = None,
+    cloud_name: Optional[str] = None,
+    api_key: Optional[str] = None,
+    api_secret: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Upload in-memory audio bytes to Cloudinary and return its URL + metadata.
+
+    Credentials come from the request (the backend injects them per call) and
+    are passed as upload options so they apply to THIS call only — no global
+    config mutation, which is safe for concurrent multi-tenant uploads. When the
+    three request credentials are absent, the worker falls back to the
+    ``CLOUDINARY_*`` env vars.
 
     Args:
         audio_bytes: the encoded audio payload to upload.
@@ -85,24 +95,32 @@ def upload_audio(
             ``None`` Cloudinary keeps the uploaded bytes' own format.
         public_id: optional custom public id (without extension); when omitted
             Cloudinary assigns a unique random id (safe for batch uploads).
+        cloud_name, api_key, api_secret: per-request Cloudinary credentials. All
+            three must be present to be used; otherwise the env config is used.
 
     Returns:
         ``{"url": str, "public_id": str|None, "format": str|None, "bytes": int|None}``
 
     Raises:
-        CloudinaryUploadError: if Cloudinary is not configured or the API call
-            fails / returns no URL.
+        CloudinaryUploadError: if no credentials are available (request or env)
+            or the API call fails / returns no URL.
     """
-    if not is_configured():
+    request_creds = {
+        "cloud_name": str(cloud_name or "").strip(),
+        "api_key": str(api_key or "").strip(),
+        "api_secret": str(api_secret or "").strip(),
+    }
+    has_request_creds = all(request_creds.values())
+
+    if not has_request_creds and not is_configured():
         raise CloudinaryUploadError(
-            "Cloudinary is not configured — set CLOUDINARY_URL (or "
-            "CLOUDINARY_CLOUD_NAME/API_KEY/API_SECRET) on the endpoint."
+            "Cloudinary credentials missing — pass cloudinary_cloud_name / "
+            "cloudinary_api_key / cloudinary_api_secret in the request input "
+            "(or set the CLOUDINARY_* env vars)."
         )
 
     try:
         import cloudinary.uploader
-
-        _ensure_config()
 
         options: Dict[str, Any] = {"resource_type": _RESOURCE_TYPE}
         folder = str(folder or "").strip().strip("/")
@@ -112,6 +130,13 @@ def upload_audio(
             options["format"] = target_format
         if public_id:
             options["public_id"] = public_id
+
+        if has_request_creds:
+            # Per-call credentials override config for this upload only.
+            options.update(request_creds)
+            options["secure"] = True
+        else:
+            _ensure_config()  # fall back to CLOUDINARY_* env vars
 
         result = cloudinary.uploader.upload(io.BytesIO(audio_bytes), **options)
     except CloudinaryUploadError:
